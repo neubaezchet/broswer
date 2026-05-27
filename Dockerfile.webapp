@@ -1,5 +1,6 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # Dockerfile para Railway — Browser Use Web App
+# Base: python:3.12-slim (Debian trixie) — paquetes con sufijo t64
 # ──────────────────────────────────────────────────────────────────────────────
 FROM python:3.12-slim
 
@@ -7,19 +8,42 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DEBIAN_FRONTEND=noninteractive \
     IN_DOCKER=true \
-    HEADLESS=true
+    HEADLESS=true \
+    PATH="/app/.venv/bin:/bin/uv:$PATH"
 
-# ── Instalar Google Chrome ────────────────────────────────────────────────────
+# ── Instalar dependencias del sistema + Google Chrome ────────────────────────
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
         wget gnupg ca-certificates curl \
-        libglib2.0-0 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
-        libcups2 libdrm2 libdbus-1-3 libexpat1 libxcb1 libxkbcommon0 \
-        libx11-6 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
-        libgbm1 libpango-1.0-0 libcairo2 libasound2 libatspi2.0-0 \
-        fonts-liberation fonts-noto-core \
-    && wget -qO- https://dl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" \
-       > /etc/apt/sources.list.d/google-chrome.list \
+        libglib2.0-0t64 \
+        libnss3 \
+        libnspr4 \
+        libatk1.0-0t64 \
+        libatk-bridge2.0-0t64 \
+        libcups2t64 \
+        libdrm2 \
+        libdbus-1-3 \
+        libexpat1 \
+        libxcb1 \
+        libxkbcommon0 \
+        libx11-6 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxext6 \
+        libxfixes3 \
+        libxrandr2 \
+        libgbm1 \
+        libpango-1.0-0 \
+        libcairo2 \
+        libasound2t64 \
+        libatspi2.0-0 \
+        fonts-liberation \
+        fonts-noto-core \
+    && install -d -m 0755 /etc/apt/keyrings \
+    && wget -qO /etc/apt/keyrings/google-chrome.asc \
+         https://dl.google.com/linux/linux_signing_key.pub \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.asc] \
+         http://dl.google.com/linux/chrome/deb/ stable main" \
+         > /etc/apt/sources.list.d/google-chrome.list \
     && apt-get update -qq \
     && apt-get install -y --no-install-recommends google-chrome-stable \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
@@ -30,19 +54,26 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # ── Código ────────────────────────────────────────────────────────────────────
 WORKDIR /app
+
+# Copiar primero solo el manifiesto para cachear deps
 COPY pyproject.toml uv.lock* ./
 
-# Instalar deps (incluye dev-deps para fastapi + uvicorn)
-RUN uv sync --frozen || uv sync
+# Primera pasada: instalar dependencias sin el código fuente
+RUN uv sync --no-install-project || uv sync
 
+# Copiar el código
 COPY . .
 
-# Re-instalar para incluir el paquete local browser-use
-RUN uv sync --frozen || uv sync
+# Segunda pasada: instalar el paquete browser-use desde fuente + todas las deps
+RUN uv sync
 
 # ── Carpetas necesarias ────────────────────────────────────────────────────────
 RUN mkdir -p /app/web_app/uploads
 
+# Verificar que Chrome y Python funcionan
+RUN google-chrome-stable --version && \
+    uv run python -c "from browser_use import Agent; print('browser-use OK')"
+
 # ── Arranque ──────────────────────────────────────────────────────────────────
 EXPOSE 8000
-CMD uv run uvicorn web_app.app:app --host 0.0.0.0 --port ${PORT:-8000}
+CMD ["uv", "run", "uvicorn", "web_app.app:app", "--host", "0.0.0.0", "--port", "8000"]
