@@ -124,6 +124,7 @@ class AgentSession:
         self.start_time: float = 0
         self.current_url: str = ""
         self.session_id: str = ""
+        self.agent: Any = None   # referencia al Agent en ejecución
 
     def reset(self, session_id: str):
         self.running = True
@@ -192,6 +193,58 @@ def save_task(entry: dict):
     tasks.insert(0, entry)
     tasks = tasks[:50]  # Máx 50 tareas
     TASKS_FILE.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ══════════════════════════════════════════════════════════════════
+# Screenshot loop — pantalla en vivo entre pasos del agente
+# ══════════════════════════════════════════════════════════════════
+
+async def _screenshot_loop(session_id: str):
+    """Captura screenshots continuos del navegador y los emite por WebSocket."""
+    import base64
+    await asyncio.sleep(1.5)   # esperar a que Chrome abra
+    sess = sessions.get(session_id)
+    while sess and sess.running:
+        try:
+            agent = sess.agent
+            if agent:
+                bs = getattr(agent, "browser_session", None)
+                if bs:
+                    screenshot: str | None = None
+
+                    # Método 1: take_screenshot() directo
+                    if hasattr(bs, "take_screenshot"):
+                        screenshot = await bs.take_screenshot()
+
+                    # Método 2: CDP captureScreenshot vía cdp_client interno
+                    if not screenshot:
+                        cdp = getattr(bs, "_cdp_client", None) or getattr(bs, "cdp_client", None)
+                        if cdp:
+                            try:
+                                result = await cdp.send.Page.captureScreenshot()
+                                screenshot = getattr(result, "data", None)
+                            except Exception:
+                                pass
+
+                    # Método 3: Playwright Page.screenshot()
+                    if not screenshot:
+                        page = getattr(bs, "_page", None) or getattr(bs, "page", None)
+                        if page:
+                            try:
+                                buf = await page.screenshot(type="png")
+                                screenshot = base64.b64encode(buf).decode()
+                            except Exception:
+                                pass
+
+                    if screenshot:
+                        await manager.send(session_id, {
+                            "tipo": "screenshot",
+                            "screenshot": screenshot,
+                            "url": sess.current_url,
+                        })
+        except Exception:
+            pass
+        await asyncio.sleep(0.8)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -267,10 +320,14 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
         # Delay aleatorio anti-detección (0.5s – 2s) entre pasos
         await asyncio.sleep(random.uniform(0.5, 2.0))
 
+        # Screenshot para la pantalla en vivo
+        screenshot = getattr(browser_state, "screenshot", None)
+
         await _emit(tipo, mensaje, {
             "step_n": step_n,
             "url": url,
             "memory": memory,
+            "screenshot": screenshot,
         })
 
     async def on_done(history: AgentHistoryList):
@@ -312,6 +369,10 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
         register_new_step_callback=on_step,
         register_done_callback=on_done,
     )
+    sess.agent = agent  # guardar referencia para screenshots y clicks
+
+    # Loop continuo de screenshots (entre pasos)
+    asyncio.create_task(_screenshot_loop(session_id))
 
     try:
         await _emit("info", "🌐 Abriendo navegador...")
@@ -430,3 +491,43 @@ async def api_config():
         "capsolver_api_key": bool(CAPSOLVER_API_KEY),
         "model": "gemini-2.5-flash",
     }
+
+
+# ── Interacción con el navegador en vivo ──────────────────────
+@app.post("/api/interact")
+async def api_interact(body: dict):
+    """Reenvía clicks/teclado del usuario al navegador del agente."""
+    session_id = body.get("session_id", "")
+    action     = body.get("action", "click")   # click | type
+    x          = int(body.get("x", 0))
+    y          = int(body.get("y", 0))
+    text       = body.get("text", "")
+
+    sess = sessions.get(session_id)
+    if not sess or not sess.agent:
+        return JSONResponse({"ok": False, "error": "Sin agente activo"}, status_code=404)
+
+    try:
+        bs = getattr(sess.agent, "browser_session", None)
+        if bs:
+            if action == "click":
+                # Método 1: execute_javascript
+                if hasattr(bs, "execute_javascript"):
+                    await bs.execute_javascript(
+                        f"(()=>{{const e=document.elementFromPoint({x},{y});if(e)e.click();}})()"
+                    )
+                    return {"ok": True}
+                # Método 2: Playwright mouse
+                page = getattr(bs, "_page", None) or getattr(bs, "page", None)
+                if page:
+                    await page.mouse.click(x, y)
+                    return {"ok": True}
+            elif action == "type":
+                page = getattr(bs, "_page", None) or getattr(bs, "page", None)
+                if page:
+                    await page.keyboard.type(text)
+                    return {"ok": True}
+    except Exception as e:
+        logger.warning(f"interact error: {e}")
+
+    return {"ok": False, "error": "No se pudo interactuar"}
