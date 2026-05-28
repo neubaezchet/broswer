@@ -318,20 +318,24 @@ async def _create_llm_with_fallback(
     fallback_model: str = "gemini-1.5-flash",
 ) -> ChatGoogle:
     """
-    Crea instancia de ChatGoogle con fallback automático si el modelo primario no está disponible.
+    CRITICAL: Monkeypatch Browser-Use + Fallback automático para gemini models.
     
-    Esto evita crashes cuando Google depreca modelos (como pasó con gemini-2.0-flash).
-    
-    Args:
-        primary_model: Modelo preferido (ej: "gemini-3-flash-preview")
-        fallback_model: Modelo alternativo si el primario falla (ej: "gemini-1.5-flash")
-    
-    Returns:
-        Instancia de ChatGoogle configurada y lista para usar
-    
-    Raises:
-        ValueError: Si ambos modelos fallan o no hay API key configurada
+    Evita el crash de gemini-2.0-flash deprecado inyectando el modelo correcto
+    en Agent.__init__ si no se proporciona llm explícitamente.
     """
+    # ── MONKEYPATCH: Forzar modelo correcto en Agent si no se proporciona ──
+    import browser_use.agent.service
+    original_init = browser_use.agent.service.Agent.__init__
+    
+    def patched_init(agent_self, *args, **kwargs):
+        if 'llm' not in kwargs and len(args) < 2:
+            from browser_use.llm.google.chat import ChatGoogle as BUChatGoogle
+            kwargs['llm'] = BUChatGoogle(model=primary_model, api_key=GOOGLE_API_KEY)
+        return original_init(agent_self, *args, **kwargs)
+    
+    browser_use.agent.service.Agent.__init__ = patched_init
+    
+    # ── Validación de API Key ──
     if not GOOGLE_API_KEY:
         raise ValueError(
             "❌ GOOGLE_API_KEY no configurada.\n"
@@ -339,7 +343,7 @@ async def _create_llm_with_fallback(
             "   O en local: export GEMINI_API_KEY=tu-clave"
         )
     
-    # Intentar modelo primario
+    # ── Intentar modelo primario ──
     try:
         logger.info(f"🔍 Intentando modelo primario: {primary_model}")
         llm = ChatGoogle(model=primary_model, api_key=GOOGLE_API_KEY)
