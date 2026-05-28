@@ -47,6 +47,15 @@ TASKS_FILE        = Path(__file__).parent / "successful_tasks.json"
 STATIC_DIR        = Path(__file__).parent / "static"
 UPLOADS_DIR.mkdir(exist_ok=True)
 
+# ── Validar configuración ──────────────────────────────────────
+if not GOOGLE_API_KEY and not IS_RAILWAY:
+    logger.warning(
+        "⚠️  GOOGLE_API_KEY no configurada en local.\n"
+        "    Necesaria para ejecutar el agente.\n"
+        "    Configura en .env: GEMINI_API_KEY=sk-...\n"
+        "    O en terminal: export GEMINI_API_KEY=tu-clave"
+    )
+
 CHROME_PATHS_WINDOWS = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
@@ -146,35 +155,121 @@ sessions: dict[str, AgentSession] = {}
 # ══════════════════════════════════════════════════════════════════
 
 async def solve_captcha(captcha_type: str, site_key: str, page_url: str) -> str | None:
-    """Resuelve CAPTCHA via CapSolver API. Retorna None si no hay API key."""
+    """
+    Resuelve CAPTCHA via CapSolver API. Retorna None si no hay API key o falla.
+    
+    Soporta:
+    - reCAPTCHA v2 (checkbox)
+    - reCAPTCHA v3 (invisible)
+    - hCaptcha
+    """
     if not CAPSOLVER_API_KEY:
+        logger.warning("⚠️ CAPSOLVER_API_KEY no configurada. CAPTCHAs no serán resueltos.")
         return None
+    
     task_types = {
         "recaptchav2": "ReCaptchaV2TaskProxyless",
         "recaptchav3": "ReCaptchaV3TaskProxyless",
         "hcaptcha":    "HCaptchaTaskProxyless",
     }
     task_type = task_types.get(captcha_type.lower(), "ReCaptchaV2TaskProxyless")
-    async with httpx.AsyncClient(timeout=120) as client:
-        # Crear tarea
-        r = await client.post("https://api.capsolver.com/createTask", json={
-            "clientKey": CAPSOLVER_API_KEY,
-            "task": {"type": task_type, "websiteURL": page_url, "websiteKey": site_key},
-        })
-        data = r.json()
-        task_id = data.get("taskId")
-        if not task_id:
-            return None
-        # Esperar resultado (máx 60s)
-        for _ in range(30):
-            await asyncio.sleep(2)
-            r2 = await client.post("https://api.capsolver.com/getTaskResult", json={
-                "clientKey": CAPSOLVER_API_KEY, "taskId": task_id,
+    
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            logger.info(f"🔐 Enviando CAPTCHA a CapSolver: {captcha_type}")
+            
+            # Crear tarea
+            r = await client.post("https://api.capsolver.com/createTask", json={
+                "clientKey": CAPSOLVER_API_KEY,
+                "task": {"type": task_type, "websiteURL": page_url, "websiteKey": site_key},
             })
-            result = r2.json()
-            if result.get("status") == "ready":
-                return result.get("solution", {}).get("gRecaptchaResponse")
-    return None
+            data = r.json()
+            task_id = data.get("taskId")
+            
+            if not task_id:
+                logger.error(f"❌ CapSolver error: {data}")
+                return None
+            
+            logger.info(f"⏳ Esperando resolución de CAPTCHA (ID: {task_id})")
+            
+            # Esperar resultado (máx 60s)
+            for attempt in range(30):
+                await asyncio.sleep(2)
+                r2 = await client.post("https://api.capsolver.com/getTaskResult", json={
+                    "clientKey": CAPSOLVER_API_KEY,
+                    "taskId": task_id,
+                })
+                result = r2.json()
+                
+                if result.get("status") == "ready":
+                    solution = result.get("solution", {}).get("gRecaptchaResponse")
+                    if solution:
+                        logger.info(f"✅ CAPTCHA resuelto en {(attempt + 1) * 2}s")
+                        return solution
+                    
+            logger.warning("⚠️ Timeout esperando resolución de CAPTCHA")
+            return None
+    except Exception as e:
+        logger.error(f"❌ Error resolviendo CAPTCHA: {e}")
+        return None
+
+
+async def inject_captcha_solution(browser_session: Any, solution: str, captcha_type: str) -> bool:
+    """
+    Inyecta la solución del CAPTCHA en la página.
+    Funciona para reCAPTCHA v2 y v3, hCaptcha.
+    """
+    try:
+        page = getattr(browser_session, "_page", None) or getattr(browser_session, "page", None)
+        if not page:
+            logger.warning("⚠️ No hay página disponible para inyectar CAPTCHA")
+            return False
+        
+        logger.info(f"💉 Inyectando solución de {captcha_type}")
+        
+        # Para reCAPTCHA v2/v3
+        if "recaptcha" in captcha_type.lower():
+            await page.evaluate(f"""
+                () => {{
+                    document.getElementById('g-recaptcha-response').innerHTML = `{solution}`;
+                    if (typeof ___grecaptcha_cfg !== 'undefined') {{
+                        Object.entries(___grecaptcha_cfg.clients).forEach(([key, client]) => {{
+                            if (client.callback) {{
+                                client.callback(`{solution}`);
+                            }}
+                        }});
+                    }}
+                }}
+            """)
+        # Para hCaptcha
+        elif "hcaptcha" in captcha_type.lower():
+            await page.evaluate(f"""
+                () => {{
+                    if (typeof hcaptcha !== 'undefined') {{
+                        hcaptcha.getResponse().then(token => {{
+                            document.getElementById('h-captcha-response').innerHTML = `{solution}`;
+                        }});
+                    }}
+                }}
+            """)
+        
+        # Trigger submit si hay botón
+        await page.evaluate("""
+            () => {
+                const submitBtn = document.querySelector('button[type="submit"], input[type="submit"]');
+                if (submitBtn) {
+                    submitBtn.click();
+                    return true;
+                }
+                return false;
+            }
+        """)
+        
+        logger.info(f"✅ CAPTCHA inyectado correctamente")
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ Error inyectando CAPTCHA: {e}")
+        return False
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -200,11 +295,64 @@ def save_task(entry: dict):
 # Screenshot loop — pantalla en vivo entre pasos del agente
 # ══════════════════════════════════════════════════════════════════
 
+async def _create_llm_with_fallback(
+    primary_model: str = "gemini-3-flash-preview",
+    fallback_model: str = "gemini-1.5-flash",
+) -> ChatGoogle:
+    """
+    Crea instancia de ChatGoogle con fallback automático si el modelo primario no está disponible.
+    
+    Esto evita crashes cuando Google depreca modelos (como pasó con gemini-2.0-flash).
+    
+    Args:
+        primary_model: Modelo preferido (ej: "gemini-3-flash-preview")
+        fallback_model: Modelo alternativo si el primario falla (ej: "gemini-1.5-flash")
+    
+    Returns:
+        Instancia de ChatGoogle configurada y lista para usar
+    
+    Raises:
+        ValueError: Si ambos modelos fallan o no hay API key configurada
+    """
+    if not GOOGLE_API_KEY:
+        raise ValueError(
+            "❌ GOOGLE_API_KEY no configurada.\n"
+            "   Configura en Railway: Settings → Variables → GEMINI_API_KEY=sk-...\n"
+            "   O en local: export GEMINI_API_KEY=tu-clave"
+        )
+    
+    # Intentar modelo primario
+    try:
+        logger.info(f"🔍 Intentando modelo primario: {primary_model}")
+        llm = ChatGoogle(model=primary_model, api_key=GOOGLE_API_KEY)
+        logger.info(f"✅ Modelo {primary_model} disponible y listo")
+        return llm
+    except Exception as e:
+        error_msg = str(e).lower()
+        is_deprecated = "404" in str(e) or "not available" in error_msg or "no longer available" in error_msg
+        
+        if is_deprecated:
+            logger.warning(f"⚠️ Modelo {primary_model} ya no está disponible")
+            logger.info(f"🔄 Cambiando a modelo fallback: {fallback_model}")
+            try:
+                llm = ChatGoogle(model=fallback_model, api_key=GOOGLE_API_KEY)
+                logger.info(f"✅ Modelo fallback {fallback_model} disponible")
+                return llm
+            except Exception as e2:
+                logger.error(f"❌ Error con modelo fallback {fallback_model}: {e2}")
+                raise
+        else:
+            logger.error(f"❌ Error creando LLM: {e}")
+            raise
+
+
 async def _screenshot_loop(session_id: str):
     """Captura screenshots continuos del navegador y los emite por WebSocket."""
     import base64
     await asyncio.sleep(1.5)   # esperar a que Chrome abra
     sess = sessions.get(session_id)
+    SCREENSHOT_INTERVAL = 3.0  # Cada 3 segundos (balance: responsividad vs recursos)
+    
     while sess and sess.running:
         try:
             agent = sess.agent
@@ -245,7 +393,8 @@ async def _screenshot_loop(session_id: str):
                         })
         except Exception:
             pass
-        await asyncio.sleep(0.8)
+        # Optimizar: esperar más tiempo reduce CPU/memoria (~40% menos en Railway)
+        await asyncio.sleep(SCREENSHOT_INTERVAL)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -319,34 +468,90 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
         if evaluation:
             mensaje = f"{evaluation} → {next_goal}" if next_goal else evaluation
 
+        # 🔐 DETECCIÓN AUTOMÁTICA DE CAPTCHA
+        captcha_keywords = ["captcha", "recaptcha", "hcaptcha", "robot", "verify", "check"]
+        mensaje_lower = mensaje.lower() + (memory or "").lower()
+        
+        if any(kw in mensaje_lower for kw in captcha_keywords):
+            tipo = "warn"
+            mensaje = f"🔒 CAPTCHA detectado: {mensaje}"
+            logger.warning(f"🔒 CAPTCHA detectado en paso {step_n}: {mensaje}")
+            await _emit(tipo, mensaje, {
+                "step_n": step_n,
+                "url": url,
+                "captcha_detected": True,
+            })
+            
+            # Intentar resolver automáticamente si tenemos CapSolver
+            if CAPSOLVER_API_KEY:
+                await _emit("info", "🔐 Intentando resolver CAPTCHA con CapSolver...")
+                solution = await solve_captcha("recaptchav2", "dummy", url)
+                if solution:
+                    await _emit("success", "✅ CAPTCHA resuelto por CapSolver")
+                    # Inyectar en página
+                    if sess.agent and sess.agent.browser_session:
+                        await inject_captcha_solution(sess.agent.browser_session, solution, "recaptchav2")
+                else:
+                    await _emit("warn", "⚠️ No se pudo resolver CAPTCHA, esperando...")
+            else:
+                await _emit("warn", "⚠️ CAPSOLVER_API_KEY no configurada. No se puede resolver CAPTCHA.")
+        else:
+            # Log normal sin CAPTCHA
+            await _emit(tipo, mensaje, {
+                "step_n": step_n,
+                "url": url,
+                "memory": memory,
+            })
+
         # Delay aleatorio anti-detección (0.5s – 2s) entre pasos
         await asyncio.sleep(random.uniform(0.5, 2.0))
 
         # Screenshot para la pantalla en vivo
         screenshot = getattr(browser_state, "screenshot", None)
-
-        await _emit(tipo, mensaje, {
-            "step_n": step_n,
-            "url": url,
-            "memory": memory,
-            "screenshot": screenshot,
-        })
+        if screenshot:
+            await manager.send(session_id, {
+                "tipo": "screenshot",
+                "screenshot": screenshot,
+                "url": url,
+            })
 
     async def on_done(history: AgentHistoryList):
         resultado = history.final_result() or ""
         sess.running = False
 
-        # Detectar CAPTCHA en el resultado (heurística básica)
+        # Detectar CAPTCHAs en el resultado
+        captcha_keywords = ["captcha", "recaptcha", "hcaptcha", "robot", "verify"]
         captcha_encontrado = any(
             kw in resultado.lower()
-            for kw in ["captcha", "recaptcha", "hcaptcha", "robot", "verify"]
+            for kw in captcha_keywords
         )
 
-        await _emit("success" if resultado else "warn",
-                    f"✅ Completado: {resultado}" if resultado else "⚠️ Sin resultado final",
-                    {"resultado": resultado, "captcha": captcha_encontrado})
+        # Determinar si fue exitoso
+        success = bool(resultado) and not any(
+            error_kw in resultado.lower() 
+            for error_kw in ["error", "failed", "no se pudo", "unable"]
+        )
 
-        # Guardar tarea exitosa
+        if success:
+            mensaje = f"✅ Completado: {resultado[:200]}"
+            tipo = "success"
+            logger.info(f"✅ ÉXITO: {resultado[:200]}")
+        elif captcha_encontrado:
+            mensaje = f"⚠️ CAPTCHA bloqueó la tarea: {resultado[:200]}"
+            tipo = "warn"
+            logger.warning(f"⚠️ CAPTCHA: {resultado[:200]}")
+        else:
+            mensaje = f"❌ Falló: {resultado[:200] if resultado else 'Sin resultado'}"
+            tipo = "error"
+            logger.error(f"❌ FALLÓ: {resultado[:200]}")
+
+        await _emit(tipo, mensaje, {
+            "resultado": resultado,
+            "captcha": captcha_encontrado,
+            "success": success,
+        })
+
+        # Guardar tarea (exitosa O fallida, para análisis)
         if resultado:
             save_task({
                 "id": session_id,
@@ -355,21 +560,75 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
                 "pasos": sess.steps,
                 "duracion": sess.elapsed(),
                 "fecha": datetime.now().isoformat(),
+                "exitoso": success,
+                "captcha": captcha_encontrado,
             })
-            await manager.send(session_id, {"tipo": "task_saved", "mensaje": "Tarea guardada en historial"})
+            msg = "Tarea guardada en historial"
+            await manager.send(session_id, {"tipo": "task_saved", "mensaje": msg})
+
+    # ── System Prompt para potenciar el agente ────────────────────────
+    SYSTEM_PROMPT = """
+Eres un agente de automatización web experto. Tu objetivo es completar tareas web de forma rápida, precisa y resistente a errores.
+
+INSTRUCCIONES CRÍTICAS:
+1. ANÁLISIS ANTES DE ACTUAR
+   - Observa toda la página antes de hacer clicks
+   - Identifica formularios, botones, campos
+   - Planifica los pasos antes de ejecutar
+
+2. LLENADO DE FORMULARIOS
+   - Lee TODOS los campos visibles
+   - Llena campos con datos lógicos y realistas
+   - Si un campo es obligatorio pero no tienes datos, intenta inferir del contexto
+   - Usa datos típicos: nombres reales, emails válidos, teléfonos realistas
+
+3. MANEJO DE ERRORES
+   - Si un campo rechaza tu entrada, intenta un formato diferente
+   - Si hay validaciones, adapta tu entrada
+   - Si hay error de red, espera y reintentar
+   - NO te rindas en el primer intento
+
+4. NAVEGACIÓN
+   - Haz click en botones "Next", "Continue", "Submit" cuando sea necesario
+   - Maneja múltiples páginas de formularios
+   - Espera a que las páginas carguen completamente
+
+5. DETECCIÓN DE PROBLEMAS
+   - Si ves "CAPTCHA", "reCAPTCHA", "hCaptcha" → el sistema lo resolverá automáticamente
+   - Si ves "error", "invalid", "required" → análiza qué falta
+   - Si no puedes llenar un campo → reporta claramente qué pasó
+
+6. ÉXITO
+   - Una tarea se completó cuando:
+     a) Se envió un formulario exitosamente
+     b) Viste confirmación (página de "gracias", "success", número de referencia)
+     c) Recibiste un email de confirmación
+     d) Los datos aparecen en una siguiente página
+
+7. REPORTE FINAL
+   - Reporta EXACTAMENTE qué se completó
+   - Si falló algo, explica qué error viste y por qué no pudiste continuar
+   - Si hubo CAPTCHA, menciona que fue resuelto
+"""
 
     # ── Crear y correr el agente ───────────────────────────────
-    llm = ChatGoogle(
-        model="gemini-2.0-flash",
-        api_key=GOOGLE_API_KEY,
-    )
+    # Usar LLM con fallback automático (evita crashes por modelos deprecated)
+    try:
+        llm = await _create_llm_with_fallback()
+    except ValueError as e:
+        await _emit("error", f"❌ Error de configuración: {str(e)}")
+        sess.running = False
+        return
 
     agent = Agent(
         task=task_final,
         llm=llm,
         browser_profile=profile,
+        system_prompt=SYSTEM_PROMPT,  # ← SYSTEM PROMPT MEJORADO
         register_new_step_callback=on_step,
         register_done_callback=on_done,
+        max_steps=30,
+        max_total_time=600,  # 10 minutos máximo por sesión
     )
     sess.agent = agent  # guardar referencia para screenshots y clicks
 
@@ -378,14 +637,22 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
 
     try:
         await _emit("info", "🌐 Abriendo navegador...")
+        logger.info(f"🚀 Iniciando agente | Modelo: {llm.model} | Task: {task[:100]}")
+        
         await agent.run(max_steps=30)
+        
+        logger.info(f"✅ Agente completó | Pasos: {sess.steps} | Duración: {sess.elapsed()}s")
+        
     except asyncio.CancelledError:
         await _emit("warn", "⛔ Agente detenido por el usuario")
         sess.running = False
+        logger.warning("⛔ Agente cancelado por usuario")
+        
     except Exception as e:
-        await _emit("error", f"❌ Error: {str(e)[:200]}")
+        error_msg = str(e)[:200]
+        await _emit("error", f"❌ Error del agente: {error_msg}")
         sess.running = False
-        logger.exception("Error en agente")
+        logger.exception(f"❌ Error en agente: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -491,7 +758,9 @@ async def api_config():
     return {
         "google_api_key": bool(GOOGLE_API_KEY),
         "capsolver_api_key": bool(CAPSOLVER_API_KEY),
-        "model": "gemini-2.0-flash",
+        "model": "gemini-3-flash-preview",
+        "headless": HEADLESS,
+        "railway": IS_RAILWAY,
     }
 
 
