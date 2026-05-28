@@ -671,6 +671,14 @@ INSTRUCCIONES CRÍTICAS:
         logger.warning("⛔ Agente cancelado por usuario")
         
     except Exception as e:
+        await _emit("error", f"❌ Error del agente: {str(e)}")
+        sess.running = False
+        logger.error(f"❌ Excepción en agente: {e}", exc_info=True)
+        
+    finally:
+        sess.running = False
+
+
 # ══════════════════════════════════════════════════════════════════
 # Modelos Pydantic
 # ══════════════════════════════════════════════════════════════════
