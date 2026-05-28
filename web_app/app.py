@@ -39,7 +39,8 @@ logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("web_app")
 
 # ── Configuración ──────────────────────────────────────────────
-GOOGLE_API_KEY    = os.getenv("GOOGLE_API_KEY", "")
+# Acepta GEMINI_API_KEY (igual que el backend) o GOOGLE_API_KEY como alias
+GOOGLE_API_KEY    = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
 UPLOADS_DIR       = Path(__file__).parent / "uploads"
 TASKS_FILE        = Path(__file__).parent / "successful_tasks.json"
@@ -274,6 +275,7 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
     profile_kwargs: dict = {
         "user_agent": random.choice(USER_AGENTS),
         "headless": HEADLESS,   # False local (visible), True en Railway
+        "wait_for_network_idle_page_load_time": 20.0,  # SPAs lentos (Compensar, EPS)
         "args": [
             "--disable-blink-features=AutomationControlled",
             "--disable-infobars",
@@ -358,7 +360,7 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
 
     # ── Crear y correr el agente ───────────────────────────────
     llm = ChatGoogle(
-        model="gemini-2.5-flash",
+        model="gemini-2.0-flash",
         api_key=GOOGLE_API_KEY,
     )
 
@@ -489,7 +491,7 @@ async def api_config():
     return {
         "google_api_key": bool(GOOGLE_API_KEY),
         "capsolver_api_key": bool(CAPSOLVER_API_KEY),
-        "model": "gemini-2.5-flash",
+        "model": "gemini-2.0-flash",
     }
 
 
