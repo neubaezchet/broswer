@@ -99,6 +99,26 @@ body { font-family: 'DM Sans', sans-serif; background: var(--bg); color: var(--t
 .log-dot.default { background: var(--txt3); }
 .log-dot.action  { background: var(--blue); }
 .log-dot.success { background: var(--green); }
+.log-dot.warn { background: var(--amber); }
+.log-dot.error { background: var(--red); }
+
+/* PDF UPLOAD */
+.pdf-section { display: flex; flex-direction: column; gap: 8px; }
+.pdf-upload { border: 2px dashed var(--border2); border-radius: var(--radius); padding: 16px; text-align: center; cursor: pointer; transition: all 0.2s; }
+.pdf-upload:hover { border-color: var(--purple); background: var(--purple-dim); }
+.pdf-upload.dragging { border-color: var(--purple); background: var(--purple-dim); }
+.pdf-upload-icon { font-size: 24px; margin-bottom: 6px; }
+.pdf-upload-text { font-size: 12px; color: var(--txt2); }
+.pdf-upload-hint { font-size: 11px; color: var(--txt3); }
+.pdf-list { display: flex; flex-direction: column; gap: 6px; max-height: 120px; overflow-y: auto; }
+.pdf-item { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; background: var(--bg2); border-radius: var(--radius-sm); border: 1px solid var(--border); font-size: 12px; }
+.pdf-item-name { display: flex; align-items: center; gap: 6px; color: var(--txt); flex: 1; }
+.pdf-item-name svg { width: 14px; height: 14px; flex-shrink: 0; }
+.pdf-item-size { font-size: 10px; color: var(--txt3); margin-right: 8px; }
+.pdf-item-remove { width: 18px; height: 18px; display: flex; align-items: center; justify-content: center; cursor: pointer; border-radius: 4px; color: var(--txt3); transition: all 0.12s; }
+.pdf-item-remove:hover { background: var(--red-dim); color: var(--red); }
+#pdf-input { display: none; }
+.log-dot.success { background: var(--green); }
 .log-dot.warn    { background: var(--amber); }
 .log-dot.error   { background: var(--red); }
 .log-dot.info    { background: var(--purple); }
@@ -279,6 +299,19 @@ select option { background: var(--bg2); }
           </div>
         </div>
       </div>
+      
+      <!-- ── PDFs SECTION ── -->
+      <div class="pdf-section">
+        <div class="sec-label">📄 Documentos adjuntos</div>
+        <div class="pdf-upload" id="pdf-upload" onclick="document.getElementById('pdf-input').click()">
+          <div class="pdf-upload-icon">📎</div>
+          <div class="pdf-upload-text">Arrastra PDFs aquí o haz click</div>
+          <div class="pdf-upload-hint">Máx 10MB por archivo</div>
+          <input type="file" id="pdf-input" accept=".pdf" multiple>
+        </div>
+        <div class="pdf-list" id="pdf-list"></div>
+      </div>
+      
       <div class="sec-label">Log en vivo</div>
       <div class="log-box" id="logbox">
         <div class="log-entry">
@@ -501,20 +534,131 @@ async function runAgent() {
   lastFpsTs = Date.now(); frameCount = 0;
 
   try {
-    const r = await fetch('/api/run', {
+    // Decidir si usar endpoint con PDFs o sin
+    const pdfIds = getPDFIds();
+    const endpoint = pdfIds.length > 0 ? '/api/run-with-pdfs' : '/api/run';
+    
+    const body = {
+      session_id: SESSION_ID,
+      task,
+      ...(pdfIds.length > 0 && { pdf_ids: pdfIds })  // Incluir PDFs si hay
+    };
+    
+    const r = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: SESSION_ID, task })
+      body: JSON.stringify(body)
     });
     const data = await r.json();
     if (data.error) {
       addLog({ tipo:'error', mensaje: data.error, timestamp: tsNow() });
       setStatus('idle');
+    } else if (pdfIds.length > 0) {
+      addLog({ tipo:'success', mensaje: `📎 Ejecutando con ${pdfIds.length} PDF(s)`, timestamp: tsNow() });
     }
   } catch (e) {
     addLog({ tipo:'error', mensaje:'Error al conectar con el servidor', timestamp: tsNow() });
     setStatus('idle');
   }
+}
+
+// ─── Gestión de PDFs ──────────────────────────────────────────
+let uploadedPDFs = [];
+
+function setupPDFUpload() {
+  const upload = document.getElementById('pdf-upload');
+  const input = document.getElementById('pdf-input');
+  
+  // Drag and drop
+  ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(evt => {
+    upload.addEventListener(evt, e => {
+      e.preventDefault();
+      e.stopPropagation();
+    });
+  });
+  
+  upload.addEventListener('dragover', () => upload.classList.add('dragging'));
+  upload.addEventListener('dragleave', () => upload.classList.remove('dragging'));
+  
+  upload.addEventListener('drop', async (e) => {
+    upload.classList.remove('dragging');
+    const files = e.dataTransfer.files;
+    for (const file of files) {
+      if (file.type === 'application/pdf') {
+        await uploadPDF(file);
+      }
+    }
+  });
+  
+  // Click to select
+  input.addEventListener('change', async (e) => {
+    for (const file of e.target.files) {
+      if (file.type === 'application/pdf') {
+        await uploadPDF(file);
+      }
+    }
+    input.value = '';  // Reset
+  });
+}
+
+async function uploadPDF(file) {
+  if (file.size > 10 * 1024 * 1024) {
+    alert('Archivo muy grande (máx 10MB)');
+    return;
+  }
+  
+  const formData = new FormData();
+  formData.append('file', file);
+  
+  try {
+    const r = await fetch(`/api/upload-pdf?session_id=${SESSION_ID}`, {
+      method: 'POST',
+      body: formData
+    });
+    const data = await r.json();
+    
+    if (data.ok) {
+      uploadedPDFs.push({
+        name: file.name,
+        id: data.pdf_id,
+        size: data.size_mb
+      });
+      renderPDFList();
+      addLog({ tipo: 'success', mensaje: `📄 ${file.name} subido` });
+    } else {
+      alert('Error: ' + data.error);
+    }
+  } catch (e) {
+    alert('Error subiendo PDF: ' + e.message);
+  }
+}
+
+function renderPDFList() {
+  const list = document.getElementById('pdf-list');
+  list.innerHTML = '';
+  
+  for (const pdf of uploadedPDFs) {
+    const item = document.createElement('div');
+    item.className = 'pdf-item';
+    item.innerHTML = `
+      <div class="pdf-item-name">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></svg>
+        ${pdf.name}
+      </div>
+      <span class="pdf-item-size">${pdf.size.toFixed(1)}MB</span>
+      <div class="pdf-item-remove" onclick="removePDF('${pdf.id}')">×</div>
+    `;
+    list.appendChild(item);
+  }
+}
+
+function removePDF(id) {
+  uploadedPDFs = uploadedPDFs.filter(p => p.id !== id);
+  renderPDFList();
+}
+
+function getPDFIds() {
+  return uploadedPDFs.map(p => p.id);
 }
 
 // ─── Detener agente ──────────────────────────────────────────
@@ -559,6 +703,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   connectWS();
   loadConfig();
+  setupPDFUpload();  // ← Inicializar PDFs
 });
 
 // ─── Historial ────────────────────────────────────────────────

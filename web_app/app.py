@@ -17,15 +17,17 @@ import os
 import random
 import time
 import uuid
+import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, List
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, WebSocket, WebSocketDisconnect, File, UploadFile, Query, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
@@ -35,6 +37,14 @@ from browser_use.llm import ChatGoogle
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.agent.views import AgentHistoryList, AgentOutput
 
+# ── Módulos extendidos ──────────────────────────────────────────
+from modules.site_mapper import map_portal, load_portal_map
+from modules.console_executor import execute_direct_api, execute_form_function
+from modules.session_pool import SessionPool
+from modules.session_manager import SessionManager
+from database import init_db, SessionLocal
+from models.portals import Portal
+
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("web_app")
 
@@ -43,9 +53,17 @@ logger = logging.getLogger("web_app")
 GOOGLE_API_KEY    = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
 UPLOADS_DIR       = Path(__file__).parent / "uploads"
+PDFS_DIR          = Path(__file__).parent / "uploads" / "pdfs"
 TASKS_FILE        = Path(__file__).parent / "successful_tasks.json"
 STATIC_DIR        = Path(__file__).parent / "static"
 UPLOADS_DIR.mkdir(exist_ok=True)
+PDFS_DIR.mkdir(exist_ok=True)
+
+# ── Inicializar servicios ──────────────────────────────────────
+init_db()  # Crear tablas SQLite
+session_manager = SessionManager()
+session_pool = SessionPool(max_sessions=20)
+pdf_storage = {}  # {session_id: [lista de paths de PDFs]}
 
 # ── Validar configuración ──────────────────────────────────────
 if not GOOGLE_API_KEY and not IS_RAILWAY:
@@ -649,10 +667,27 @@ INSTRUCCIONES CRÍTICAS:
         logger.warning("⛔ Agente cancelado por usuario")
         
     except Exception as e:
-        error_msg = str(e)[:200]
-        await _emit("error", f"❌ Error del agente: {error_msg}")
-        sess.running = False
-        logger.exception(f"❌ Error en agente: {e}")
+# ══════════════════════════════════════════════════════════════════
+# Modelos Pydantic
+# ══════════════════════════════════════════════════════════════════
+
+class PDFInfo(BaseModel):
+    filename: str
+    path: str
+    size_mb: float
+    uploaded_at: str
+    mime_type: str = "application/pdf"
+
+
+class SessionPDFs(BaseModel):
+    session_id: str
+    pdfs: List[PDFInfo] = []
+    total_size_mb: float = 0.0
+
+
+class TaskWithPDFs(BaseModel):
+    task: str
+    pdf_ids: List[str] = []  # IDs de PDFs a incluir
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -802,3 +837,181 @@ async def api_interact(body: dict):
         logger.warning(f"interact error: {e}")
 
     return {"ok": False, "error": "No se pudo interactuar"}
+
+
+# ══════════════════════════════════════════════════════════════════
+# PDFs Management — Upload, list, delete
+# ══════════════════════════════════════════════════════════════════
+
+@app.post("/api/upload-pdf")
+async def upload_pdf(
+    session_id: str = Query(...),
+    file: UploadFile = File(...),
+):
+    """
+    Sube un PDF a la sesión actual.
+    
+    Uso:
+        curl -X POST "http://localhost:8000/api/upload-pdf?session_id=123" \
+             -F "file=@documento.pdf"
+    """
+    
+    try:
+        if not file.filename.endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Solo se aceptan archivos PDF")
+        
+        # Generar nombre único
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        unique_filename = f"{timestamp}_{file.filename}"
+        file_path = PDFS_DIR / unique_filename
+        
+        # Guardar archivo
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        size_mb = len(content) / (1024 * 1024)
+        
+        # Registrar en storage
+        if session_id not in pdf_storage:
+            pdf_storage[session_id] = []
+        
+        pdf_info = PDFInfo(
+            filename=file.filename,
+            path=str(file_path),
+            size_mb=round(size_mb, 2),
+            uploaded_at=datetime.utcnow().isoformat(),
+        )
+        
+        pdf_storage[session_id].append(pdf_info)
+        
+        logger.info(f"📄 PDF subido: {file.filename} ({size_mb:.2f}MB)")
+        
+        return {
+            "ok": True,
+            "message": f"PDF '{file.filename}' subido exitosamente",
+            "pdf_id": unique_filename,
+            "size_mb": pdf_info.size_mb,
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error subiendo PDF: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/pdfs/{session_id}")
+async def get_session_pdfs(session_id: str):
+    """Obtiene lista de PDFs en la sesión."""
+    
+    pdfs = pdf_storage.get(session_id, [])
+    total_size = sum(pdf.size_mb for pdf in pdfs)
+    
+    return SessionPDFs(
+        session_id=session_id,
+        pdfs=pdfs,
+        total_size_mb=round(total_size, 2),
+    )
+
+
+@app.delete("/api/pdfs/{session_id}/{pdf_id}")
+async def delete_pdf(session_id: str, pdf_id: str):
+    """Elimina un PDF de la sesión."""
+    
+    try:
+        pdfs = pdf_storage.get(session_id, [])
+        
+        for i, pdf in enumerate(pdfs):
+            if pdf.filename == pdf_id or pdf.path.endswith(pdf_id):
+                # Eliminar archivo físico
+                path = Path(pdf.path)
+                if path.exists():
+                    path.unlink()
+                
+                # Eliminar de lista
+                pdfs.pop(i)
+                logger.info(f"🗑️ PDF eliminado: {pdf_id}")
+                
+                return {"ok": True, "message": f"PDF '{pdf_id}' eliminado"}
+        
+        raise HTTPException(status_code=404, detail="PDF no encontrado")
+        
+    except Exception as e:
+        logger.error(f"❌ Error eliminando PDF: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/pdfs/{session_id}/{pdf_id}/download")
+async def download_pdf(session_id: str, pdf_id: str):
+    """Descarga un PDF."""
+    
+    try:
+        pdfs = pdf_storage.get(session_id, [])
+        
+        for pdf in pdfs:
+            if pdf.filename == pdf_id or pdf.path.endswith(pdf_id):
+                path = Path(pdf.path)
+                if path.exists():
+                    return FileResponse(
+                        path,
+                        media_type="application/pdf",
+                        filename=pdf.filename,
+                    )
+        
+        raise HTTPException(status_code=404, detail="PDF no encontrado")
+        
+    except Exception as e:
+        logger.error(f"❌ Error descargando PDF: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/run-with-pdfs")
+async def run_with_pdfs(body: dict):
+    """
+    Ejecuta tarea con PDFs adjuntos.
+    
+    Request:
+    {
+        "task": "Procesar estos documentos",
+        "session_id": "123",
+        "pdf_ids": ["documento1.pdf", "documento2.pdf"]
+    }
+    """
+    
+    session_id = body.get("session_id", str(uuid.uuid4()))
+    task = body.get("task", "").strip()
+    pdf_ids = body.get("pdf_ids", [])
+    
+    if not task:
+        return JSONResponse({"error": "Tarea vacía"}, status_code=400)
+    
+    # Obtener rutas de PDFs
+    pdf_paths = []
+    pdfs = pdf_storage.get(session_id, [])
+    
+    for pdf_id in pdf_ids:
+        for pdf in pdfs:
+            if pdf.filename == pdf_id or pdf.path.endswith(pdf_id):
+                pdf_paths.append(pdf.path)
+                break
+    
+    if pdf_ids and not pdf_paths:
+        return JSONResponse({"error": "PDFs no encontrados"}, status_code=404)
+    
+    # Agregar PDFs al task
+    if pdf_paths:
+        task += f"\n\n📎 ARCHIVOS ADJUNTOS:\n" + "\n".join(pdf_paths)
+    
+    # Ejecutar agente
+    if not GOOGLE_API_KEY:
+        return JSONResponse({"error": "GOOGLE_API_KEY no configurada"}, status_code=500)
+    
+    sess = AgentSession()
+    sess.reset(session_id)
+    sessions[session_id] = sess
+    
+    task_obj = asyncio.create_task(run_agent(session_id, task, pdf_paths))
+    sess.task = task_obj
+    
+    logger.info(f"🚀 Tarea iniciada con {len(pdf_paths)} PDFs")
+    
+    return {"ok": True, "session_id": session_id, "pdf_count": len(pdf_paths)}
