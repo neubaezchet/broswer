@@ -313,28 +313,13 @@ def save_task(entry: dict):
 # Screenshot loop — pantalla en vivo entre pasos del agente
 # ══════════════════════════════════════════════════════════════════
 
-async def _create_llm_with_fallback(
-    primary_model: str = "gemini-3-flash-preview",
-    fallback_model: str = "gemini-1.5-flash",
-) -> ChatGoogle:
+async def _create_llm_with_fallback() -> ChatGoogle:
     """
-    CRITICAL: Monkeypatch Browser-Use + Fallback automático para gemini models.
+    CRITICAL: Browser-Use LLM selection con fallback automático.
     
-    Evita el crash de gemini-2.0-flash deprecado inyectando el modelo correcto
-    en Agent.__init__ si no se proporciona llm explícitamente.
+    Replicated from BACKENDBETATWILEND/app/gemini_plano_service.py.
+    Intenta modelos en orden: gemini-2.5-flash → gemini-2.0-flash → gemini-1.5-flash
     """
-    # ── MONKEYPATCH: Forzar modelo correcto en Agent si no se proporciona ──
-    import browser_use.agent.service
-    original_init = browser_use.agent.service.Agent.__init__
-    
-    def patched_init(agent_self, *args, **kwargs):
-        if 'llm' not in kwargs and len(args) < 2:
-            from browser_use.llm.google.chat import ChatGoogle as BUChatGoogle
-            kwargs['llm'] = BUChatGoogle(model=primary_model, api_key=GOOGLE_API_KEY)
-        return original_init(agent_self, *args, **kwargs)
-    
-    browser_use.agent.service.Agent.__init__ = patched_init
-    
     # ── Validación de API Key ──
     if not GOOGLE_API_KEY:
         raise ValueError(
@@ -343,29 +328,63 @@ async def _create_llm_with_fallback(
             "   O en local: export GEMINI_API_KEY=tu-clave"
         )
     
-    # ── Intentar modelo primario ──
-    try:
-        logger.info(f"🔍 Intentando modelo primario: {primary_model}")
-        llm = ChatGoogle(model=primary_model, api_key=GOOGLE_API_KEY)
-        logger.info(f"✅ Modelo {primary_model} disponible y listo")
-        return llm
-    except Exception as e:
-        error_msg = str(e).lower()
-        is_deprecated = "404" in str(e) or "not available" in error_msg or "no longer available" in error_msg
-        
-        if is_deprecated:
-            logger.warning(f"⚠️ Modelo {primary_model} ya no está disponible")
-            logger.info(f"🔄 Cambiando a modelo fallback: {fallback_model}")
-            try:
-                llm = ChatGoogle(model=fallback_model, api_key=GOOGLE_API_KEY)
-                logger.info(f"✅ Modelo fallback {fallback_model} disponible")
-                return llm
-            except Exception as e2:
-                logger.error(f"❌ Error con modelo fallback {fallback_model}: {e2}")
-                raise
-        else:
-            logger.error(f"❌ Error creando LLM: {e}")
-            raise
+    # ── Lista de modelos a intentar (en orden, mismo que backend) ──
+    MODELS_TO_TRY = [
+        os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),  # env override si existe
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-8b",
+    ]
+    MODELS_TO_TRY = list(dict.fromkeys(MODELS_TO_TRY))  # Remove duplicates, keep order
+    
+    # ── Monkeypatch: Inyectar modelo en Agent.__init__ ──
+    import browser_use.agent.service
+    original_init = browser_use.agent.service.Agent.__init__
+    
+    selected_model = None
+    
+    def patched_init(agent_self, *args, **kwargs):
+        nonlocal selected_model
+        if 'llm' not in kwargs and len(args) < 2:
+            from browser_use.llm.google.chat import ChatGoogle as BUChatGoogle
+            kwargs['llm'] = BUChatGoogle(model=selected_model, api_key=GOOGLE_API_KEY)
+        return original_init(agent_self, *args, **kwargs)
+    
+    # ── Intentar cada modelo en orden ──
+    for model in MODELS_TO_TRY:
+        try:
+            logger.info(f"🔍 Probando modelo: {model}")
+            selected_model = model
+            llm = ChatGoogle(model=model, api_key=GOOGLE_API_KEY)
+            
+            # Verificar que el modelo responda
+            # (ChatGoogle no prueba la conexión en __init__, pero Browser-Use sí lo hará)
+            logger.info(f"✅ Modelo '{model}' seleccionado y listo")
+            browser_use.agent.service.Agent.__init__ = patched_init
+            return llm
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            is_not_available = (
+                "404" in str(e) or 
+                "not_found" in error_msg or 
+                "not available" in error_msg or 
+                "no longer available" in error_msg
+            )
+            
+            if is_not_available:
+                logger.warning(f"⚠️ Modelo '{model}' no disponible (404), probando siguiente...")
+                continue
+            else:
+                logger.warning(f"⚠️ Modelo '{model}' error: {e}, probando siguiente...")
+                continue
+    
+    # ── Fallback final: si ninguno funciona, retorna el primero (Railway lo reintentatá) ──
+    logger.error(f"❌ Ningún modelo Gemini funcionó. Retornando {MODELS_TO_TRY[0]} como última opción.")
+    selected_model = MODELS_TO_TRY[0]
+    browser_use.agent.service.Agent.__init__ = patched_init
+    return ChatGoogle(model=MODELS_TO_TRY[0], api_key=GOOGLE_API_KEY)
 
 
 async def _screenshot_loop(session_id: str):
