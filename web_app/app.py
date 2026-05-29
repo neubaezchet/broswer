@@ -52,6 +52,8 @@ logger = logging.getLogger("web_app")
 # Acepta GEMINI_API_KEY (igual que el backend) o GOOGLE_API_KEY como alias
 GOOGLE_API_KEY    = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
+IS_RAILWAY        = os.getenv("RAILWAY_ENVIRONMENT") is not None or os.getenv("RAILWAY_SERVICE_NAME") is not None
+HEADLESS          = IS_RAILWAY or os.getenv("HEADLESS", "false").lower() == "true"
 UPLOADS_DIR       = Path(__file__).parent / "uploads"
 PDFS_DIR          = Path(__file__).parent / "uploads" / "pdfs"
 TASKS_FILE        = Path(__file__).parent / "successful_tasks.json"
@@ -79,10 +81,6 @@ CHROME_PATHS_WINDOWS = [
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
     r"C:\Users\david.baeza\AppData\Local\Google\Chrome\Application\chrome.exe",
 ]
-
-# En Railway/Linux el navegador es headless (sin pantalla)
-IS_RAILWAY = os.getenv("RAILWAY_ENVIRONMENT") is not None or os.getenv("RAILWAY_SERVICE_NAME") is not None
-HEADLESS    = IS_RAILWAY or os.getenv("HEADLESS", "false").lower() == "true"
 
 def _find_chrome() -> str | None:
     """Busca Chrome: rutas Windows en local, chromium en Linux/Railway."""
@@ -802,17 +800,6 @@ async def api_stop(body: dict):
         sess.running = False
         return {"ok": True, "mensaje": "Agente detenido"}
     return {"ok": False, "mensaje": "No hay agente activo"}
-
-
-# ── Subir PDF ──────────────────────────────────────────────────
-@app.post("/api/upload-pdf")
-async def api_upload_pdf(file: UploadFile):
-    if not file.filename.endswith(".pdf"):
-        return JSONResponse({"error": "Solo se aceptan PDFs"}, status_code=400)
-    safe_name = f"{uuid.uuid4().hex}_{file.filename}"
-    dest = UPLOADS_DIR / safe_name
-    dest.write_bytes(await file.read())
-    return {"ok": True, "filename": safe_name, "path": str(dest), "url": f"/uploads/{safe_name}"}
 
 
 # ── Historial de tareas ────────────────────────────────────────

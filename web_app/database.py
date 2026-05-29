@@ -6,10 +6,11 @@ from sqlalchemy.orm import sessionmaker, Session
 from models.portals import Base
 
 # SQLite en local, PostgreSQL en producción
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "sqlite:///./broswer_portals.db"
-)
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./broswer_portals.db")
+
+# Railway entrega URLs con prefijo "postgres://" — SQLAlchemy 2.x requiere "postgresql://"
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 engine = create_engine(
     DATABASE_URL,
