@@ -423,54 +423,41 @@ def _get_fallback_llm() -> ChatGoogle | None:
 
 
 async def _screenshot_loop(session_id: str):
-    """Captura screenshots continuos del navegador y los emite por WebSocket."""
+    """
+    Captura y emite screenshots EN TIEMPO REAL del navegador.
+    Browser-Use genera screenshots automáticamente - los capturamos del state.
+    """
     import base64
-    await asyncio.sleep(1.5)   # esperar a que Chrome abra
+    await asyncio.sleep(1)  # Esperar a que Chrome abra
     sess = sessions.get(session_id)
-    SCREENSHOT_INTERVAL = 3.0  # Cada 3 segundos (balance: responsividad vs recursos)
     
     while sess and sess.running:
         try:
             agent = sess.agent
             if agent:
-                bs = getattr(agent, "browser_session", None)
-                if bs:
-                    screenshot: str | None = None
-
-                    # Método 1: take_screenshot() directo
-                    if hasattr(bs, "take_screenshot"):
-                        screenshot = await bs.take_screenshot()
-
-                    # Método 2: CDP captureScreenshot vía cdp_client interno
-                    if not screenshot:
-                        cdp = getattr(bs, "_cdp_client", None) or getattr(bs, "cdp_client", None)
-                        if cdp:
-                            try:
-                                result = await cdp.send.Page.captureScreenshot()
-                                screenshot = getattr(result, "data", None)
-                            except Exception:
-                                pass
-
-                    # Método 3: Playwright Page.screenshot()
-                    if not screenshot:
-                        page = getattr(bs, "_page", None) or getattr(bs, "page", None)
-                        if page:
-                            try:
-                                buf = await page.screenshot(type="png")
-                                screenshot = base64.b64encode(buf).decode()
-                            except Exception:
-                                pass
-
-                    if screenshot:
+                # ── Obtener state del agente (incluye screenshot) ──
+                state = agent.state
+                if state and hasattr(state, 'screenshot') and state.screenshot:
+                    screenshot_b64 = state.screenshot
+                    # Si no es base64, codificarlo
+                    if not isinstance(screenshot_b64, str):
+                        screenshot_b64 = base64.b64encode(screenshot_b64).decode() if isinstance(screenshot_b64, bytes) else None
+                    
+                    if screenshot_b64:
+                        # Emitir screenshot por WebSocket
                         await manager.send(session_id, {
                             "tipo": "screenshot",
-                            "screenshot": screenshot,
-                            "url": sess.current_url,
+                            "screenshot": screenshot_b64,
+                            "url": getattr(state, "url", "") or sess.current_url,
                         })
-        except Exception:
-            pass
-        # Optimizar: esperar más tiempo reduce CPU/memoria (~40% menos en Railway)
-        await asyncio.sleep(SCREENSHOT_INTERVAL)
+                        
+                        # Log cada screenshot emitido (opcional, quitar si es muy verbose)
+                        logger.debug(f"📸 Screenshot emitido para {session_id}")
+        except Exception as e:
+            logger.debug(f"⚠️ Error en screenshot loop: {e}")
+        
+        # Intervalo más rápido para UI responsiva (1.5s = ~0.67 fps)
+        await asyncio.sleep(1.5)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -585,11 +572,19 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
         # Screenshot para la pantalla en vivo
         screenshot = getattr(browser_state, "screenshot", None)
         if screenshot:
-            await manager.send(session_id, {
-                "tipo": "screenshot",
-                "screenshot": screenshot,
-                "url": url,
-            })
+            # Asegurar que es base64 string
+            if isinstance(screenshot, bytes):
+                import base64
+                screenshot = base64.b64encode(screenshot).decode()
+            
+            if isinstance(screenshot, str) and screenshot.strip():
+                await manager.send(session_id, {
+                    "tipo": "screenshot",
+                    "screenshot": screenshot,
+                    "url": url,
+                    "step_n": step_n,
+                })
+                logger.debug(f"📸 Screenshot emitido en paso {step_n}")
 
     async def on_done(history: AgentHistoryList):
         resultado = history.final_result() or ""
