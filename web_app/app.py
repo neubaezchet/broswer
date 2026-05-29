@@ -402,6 +402,26 @@ def _get_llm_for_agent() -> ChatGoogle:
     return llm_service.get_llm()
 
 
+def _get_fallback_llm() -> ChatGoogle | None:
+    """Retorna LLM fallback para cuando el principal falla por 503 o similar."""
+    if llm_service is None:
+        return None
+    
+    # Obtener el próximo modelo disponible (no el activo)
+    current = llm_service.model
+    for modelo in llm_service.MODELS_FALLBACK:
+        if modelo != current:
+            try:
+                logger.info(f"🔄 Configurando fallback LLM: {modelo}")
+                return ChatGoogle(model=modelo, api_key=GOOGLE_API_KEY)
+            except Exception as e:
+                logger.warning(f"⚠️ Fallback model {modelo} error: {e}")
+                continue
+    
+    logger.warning("⚠️ No se pudo configurar fallback LLM")
+    return None
+
+
 async def _screenshot_loop(session_id: str):
     """Captura screenshots continuos del navegador y los emite por WebSocket."""
     import base64
@@ -671,6 +691,7 @@ INSTRUCCIONES CRÍTICAS:
     # Usar LLM detectado en startup (modelo seleccionado automáticamente)
     try:
         llm = _get_llm_for_agent()
+        fallback_llm = _get_fallback_llm()  # ← FALLBACK para cuando falla por 503
     except ValueError as e:
         await _emit("error", f"❌ Error de configuración: {str(e)}")
         sess.running = False
@@ -679,6 +700,7 @@ INSTRUCCIONES CRÍTICAS:
     agent = Agent(
         task=task_final,
         llm=llm,
+        fallback_llm=fallback_llm,  # ← CRITICAL: Auto-retry con modelo alterno si 503
         browser_profile=profile,
         system_prompt=SYSTEM_PROMPT,  # ← SYSTEM PROMPT MEJORADO
         register_new_step_callback=on_step,
