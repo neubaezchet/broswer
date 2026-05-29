@@ -819,6 +819,36 @@ async def api_stop(body: dict):
     return {"ok": False, "mensaje": "No hay agente activo"}
 
 
+@app.post("/api/pause")
+async def api_pause(body: dict):
+    """Pausa la ejecución del agente."""
+    session_id = body.get("session_id", "")
+    sess = sessions.get(session_id)
+    if sess and sess.running:
+        sess.running = False
+        await manager.send(session_id, {
+            "tipo": "info",
+            "msg": "⏸️ Agente pausado - lista anotaciones activas"
+        })
+        return {"ok": True, "mensaje": "Agente pausado"}
+    return {"ok": False, "mensaje": "No hay agente activo"}
+
+
+@app.post("/api/resume")
+async def api_resume(body: dict):
+    """Reanuda la ejecución del agente."""
+    session_id = body.get("session_id", "")
+    sess = sessions.get(session_id)
+    if sess:
+        sess.running = True
+        await manager.send(session_id, {
+            "tipo": "success",
+            "msg": "▶️ Ejecución reanudada"
+        })
+        return {"ok": True, "mensaje": "Agente reanudado"}
+    return {"ok": False, "mensaje": "No hay sesión activa"}
+
+
 # ── Historial de tareas ────────────────────────────────────────
 @app.get("/api/tasks")
 async def api_tasks():

@@ -82,8 +82,22 @@ body { font-family: 'DM Sans', sans-serif; background: var(--bg); color: var(--t
 .run-btn { display: flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border2); background: var(--purple-dim); font-size: 12px; font-weight: 600; color: var(--purple); cursor: pointer; transition: all 0.12s; font-family: 'DM Sans', sans-serif; }
 .run-btn:hover { background: rgba(124,106,245,0.25); border-color: rgba(124,106,245,0.4); }
 .run-btn svg { width: 13px; height: 13px; }
-.stop-btn { display: none; align-items: center; gap: 6px; padding: 6px 14px; border-radius: var(--radius-sm); border: 1px solid rgba(248,113,113,0.3); background: var(--red-dim); font-size: 12px; font-weight: 600; color: var(--red); cursor: pointer; transition: all 0.12s; font-family: 'DM Sans', sans-serif; }
-.stop-btn:hover { background: rgba(248,113,113,0.2); }
+/* CONTROL BUTTONS FLAT */
+.control-btn { display: none; align-items: center; gap: 6px; padding: 6px 14px; border-radius: var(--radius-sm); border: none; background: transparent; font-size: 12px; font-weight: 600; color: var(--txt); cursor: pointer; transition: all 0.12s; font-family: 'DM Sans', sans-serif; position: relative; }
+.control-btn:hover { background: var(--bg2); }
+
+/* DROPDOWN MENU */
+.control-menu { display: none; position: absolute; bottom: 100%; right: 0; margin-bottom: 6px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; z-index: 100; min-width: 160px; box-shadow: 0 4px 12px rgba(0,0,0,0.2); }
+.control-menu.active { display: flex; flex-direction: column; }
+.control-menu-item { padding: 9px 12px; font-size: 12px; color: var(--txt2); cursor: pointer; transition: background 0.12s; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
+.control-menu-item:last-child { border-bottom: none; }
+.control-menu-item:hover { background: var(--bg3); color: var(--txt); }
+.control-menu-item.pause { color: var(--amber); }
+.control-menu-item.pause:hover { background: rgba(251,191,36,0.1); }
+.control-menu-item.resume { color: var(--green); }
+.control-menu-item.resume:hover { background: rgba(74,222,128,0.1); }
+.control-menu-item.stop { color: var(--red); }
+.control-menu-item.stop:hover { background: rgba(248,113,113,0.1); }
 
 /* LOG */
 .log-box { background: var(--bg2); border-radius: var(--radius); border: 1px solid var(--border); overflow: hidden; max-height: 240px; overflow-y: auto; }
@@ -288,13 +302,45 @@ select option { background: var(--bg2); }
         <div class="task-foot">
           <span class="hint-txt">El agente detecta los campos del formulario antes de actuar</span>
           <div class="btn-row">
-            <button class="stop-btn" id="btn-stop" onclick="stopAgent()">
-              <svg viewBox="0 0 13 13" fill="currentColor" width="13" height="13"><rect x="2" y="2" width="9" height="9" rx="1"/></svg>
-              Detener
-            </button>
+            <div style="position: relative;">
+              <button class="control-btn" id="btn-control" onclick="toggleControlMenu()">
+                <svg viewBox="0 0 16 16" fill="currentColor" width="13" height="13" style="display:none;" id="icon-pause"><path d="M6 2h2v12H6V2zm4 0h2v12h-2V2z"/></svg>
+                <svg viewBox="0 0 16 16" fill="currentColor" width="13" height="13" style="display:none;" id="icon-play"><path d="M3 2l8 4.5-8 4.5V2z"/></svg>
+                <svg viewBox="0 0 16 16" fill="currentColor" width="13" height="13" id="icon-stop"><rect x="2" y="2" width="9" height="9" rx="1"/></svg>
+                <span id="control-text">Detener</span>
+              </button>
+              <div class="control-menu" id="control-menu">
+                <div class="control-menu-item pause" onclick="pauseAgent()">
+                  <svg viewBox="0 0 16 16" fill="currentColor" width="12" height="12"><path d="M6 2h2v12H6V2zm4 0h2v12h-2V2z"/></svg>
+                  <span>⏸ Pausar</span>
+                </div>
+                <div class="control-menu-item resume" onclick="resumeAgent()" style="display:none;" id="resume-item">
+                  <svg viewBox="0 0 16 16" fill="currentColor" width="12" height="12"><path d="M3 2l8 4.5-8 4.5V2z"/></svg>
+                  <span>▶ Reanudar</span>
+                </div>
+                <div class="control-menu-item stop" onclick="terminateAgent()">
+                  <svg viewBox="0 0 16 16" fill="currentColor" width="12" height="12"><rect x="2" y="2" width="9" height="9" rx="1"/></svg>
+                  <span>⏹ Terminar</span>
+                </div>
+              </div>
+            </div>
             <button class="run-btn" id="btn-run" onclick="runAgent()">
               <svg viewBox="0 0 13 13" fill="currentColor"><path d="M3 2l8 4.5L3 11V2z"/></svg>
               Ejecutar
+            </button>
+          </div>
+        </div>
+        
+        <!-- ANOTACIONES DURANTE PAUSA -->
+        <div id="annotations-panel" style="display:none; margin-top:12px; padding:10px; background:var(--bg2); border:1px solid var(--border); border-radius:var(--radius-sm);">
+          <div style="font-size:11px; font-weight:600; color:var(--txt3); margin-bottom:8px;">📝 Anotaciones de Pausa</div>
+          <textarea id="annotations-input" placeholder="Escribe tus anotaciones aquí..." style="width:100%; height:80px; padding:8px; border:1px solid var(--border); border-radius:4px; background:var(--bg3); color:var(--txt); font-size:12px; resize:vertical; font-family:'DM Sans',sans-serif;"></textarea>
+          <div style="margin-top:8px; display:flex; gap:6px;">
+            <button onclick="saveAnnotation()" style="flex:1; padding:6px; background:var(--green-dim); color:var(--green); border:none; border-radius:4px; font-size:11px; font-weight:600; cursor:pointer;">
+              💾 Guardar
+            </button>
+            <button onclick="clearAnnotation()" style="flex:1; padding:6px; background:var(--bg3); color:var(--txt3); border:1px solid var(--border); border-radius:4px; font-size:11px; font-weight:600; cursor:pointer;">
+              Limpiar
             </button>
           </div>
         </div>
@@ -485,17 +531,18 @@ function setStatus(s) {
   const stxt  = document.getElementById('stxt');
   const badge = document.getElementById('pbadge');
   const btnR  = document.getElementById('btn-run');
-  const btnS  = document.getElementById('btn-stop');
+  const btnC  = document.getElementById('btn-control');
   if (s === 'running') {
     sdot.className = 'status-dot running'; stxt.textContent = 'Ejecutando';
     badge.className = 'badge running';     badge.textContent = 'En curso';
-    btnR.style.display = 'none'; btnS.style.display = 'flex';
+    btnR.style.display = 'none'; btnC.style.display = 'flex';
     document.getElementById('fps-dot').className = '';
     document.getElementById('fps-txt').textContent = 'conectando...';
   } else {
     sdot.className = 'status-dot idle'; stxt.textContent = 'En espera';
     badge.className = 'badge done';     badge.textContent = 'Completado';
-    btnR.style.display = 'flex'; btnS.style.display = 'none';
+    btnR.style.display = 'flex'; btnC.style.display = 'none';
+    document.getElementById('control-menu').classList.remove('active');
     document.getElementById('fps-dot').className = '';
     document.getElementById('fps-txt').textContent = 'sin señal';
   }
@@ -661,14 +708,119 @@ function getPDFIds() {
   return uploadedPDFs.map(p => p.id);
 }
 
-// ─── Detener agente ──────────────────────────────────────────
-async function stopAgent() {
+// ─── Variables de control ─────────────────────────────────────
+let agentPaused = false;
+let agentAnnotations = [];
+
+// ─── Toggle Control Menu ──────────────────────────────────────
+function toggleControlMenu() {
+  const menu = document.getElementById('control-menu');
+  menu.classList.toggle('active');
+  document.addEventListener('click', closeMenuOnClickOutside, { once: true });
+}
+
+function closeMenuOnClickOutside(e) {
+  const menu = document.getElementById('control-menu');
+  const btn = document.getElementById('btn-control');
+  if (!menu.contains(e.target) && !btn.contains(e.target)) {
+    menu.classList.remove('active');
+  }
+}
+
+// ─── Pausar agente ────────────────────────────────────────────
+async function pauseAgent() {
+  agentPaused = true;
+  document.getElementById('control-menu').classList.remove('active');
+  
+  await fetch('/api/pause', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: SESSION_ID })
+  });
+  
+  // Actualizar UI
+  const pauseItem = document.querySelector('.control-menu-item.pause');
+  const resumeItem = document.getElementById('resume-item');
+  pauseItem.style.display = 'none';
+  resumeItem.style.display = 'flex';
+  
+  document.getElementById('icon-stop').style.display = 'none';
+  document.getElementById('icon-pause').style.display = 'block';
+  document.getElementById('control-text').textContent = 'Pausado';
+  
+  // Mostrar panel de anotaciones\n  document.getElementById('annotations-panel').style.display = 'block';
+  
+  addLog({ tipo: 'info', msg: '⏸️ Ejecución pausada - puedes agregar anotaciones' });
+}
+
+// ─── Reanudar agente ──────────────────────────────────────────
+async function resumeAgent() {
+  agentPaused = false;
+  document.getElementById('control-menu').classList.remove('active');
+  
+  await fetch('/api/resume', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: SESSION_ID })
+  });
+  
+  // Actualizar UI
+  const pauseItem = document.querySelector('.control-menu-item.pause');
+  const resumeItem = document.getElementById('resume-item');
+  pauseItem.style.display = 'flex';
+  resumeItem.style.display = 'none';
+  
+  document.getElementById('icon-pause').style.display = 'none';
+  document.getElementById('icon-stop').style.display = 'block';
+  document.getElementById('control-text').textContent = 'Detener';
+  
+  // Ocultar panel de anotaciones
+  document.getElementById('annotations-panel').style.display = 'none';
+  
+  addLog({ tipo: 'success', msg: '▶️ Ejecución reanudada' });
+}
+
+// ─── Terminar agente ──────────────────────────────────────────
+async function terminateAgent() {
+  document.getElementById('control-menu').classList.remove('active');
+  
   await fetch('/api/stop', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ session_id: SESSION_ID })
   });
+  
+  // Resetear UI
+  agentPaused = false;
+  document.getElementById('annotations-panel').style.display = 'none';
+  const pauseItem = document.querySelector('.control-menu-item.pause');
+  const resumeItem = document.getElementById('resume-item');
+  pauseItem.style.display = 'flex';
+  resumeItem.style.display = 'none';
+  
   setStatus('idle');
+  addLog({ tipo: 'error', msg: '⏹️ Ejecución terminada' });
+}
+
+// ─── Guardar anotación ────────────────────────────────────────
+function saveAnnotation() {
+  const text = document.getElementById('annotations-input').value;
+  if (!text.trim()) return;
+  
+  const ts = new Date().toLocaleTimeString();
+  agentAnnotations.push({ time: ts, text: text });
+  
+  addLog({
+    tipo: 'action',
+    msg: `📝 Anotación guardada: ${text.substring(0, 50)}...`
+  });
+  
+  document.getElementById('annotations-input').value = '';
+}
+
+// ─── Limpiar anotación ────────────────────────────────────────
+function clearAnnotation() {
+  document.getElementById('annotations-input').value = '';
 }
 
 // ─── Click en pantalla en vivo ────────────────────────────────
