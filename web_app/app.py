@@ -431,39 +431,63 @@ def _get_fallback_llm() -> ChatGoogle | None:
 async def _screenshot_loop(session_id: str):
     """
     Captura y emite screenshots EN TIEMPO REAL del navegador.
-    Browser-Use genera screenshots automáticamente - los capturamos del state.
+    Accede directamente a la página de Playwright.
+    Espera a que browser_session esté listo antes de intentar capturar.
     """
     import base64
-    await asyncio.sleep(1)  # Esperar a que Chrome abra
+    
     sess = sessions.get(session_id)
+    if not sess:
+        return
+    
+    # Esperar a que el agente esté completamente inicializado
+    for _ in range(30):  # Esperar máx 30s
+        if sess.agent and sess.agent.browser_session:
+            break
+        await asyncio.sleep(1)
+    
+    logger.info(f"📸 Screenshot loop iniciado para {session_id}")
     
     while sess and sess.running:
         try:
             agent = sess.agent
-            if agent:
-                # ── Obtener state del agente (incluye screenshot) ──
-                state = agent.state
-                if state and hasattr(state, 'screenshot') and state.screenshot:
-                    screenshot_b64 = state.screenshot
-                    # Si no es base64, codificarlo
-                    if not isinstance(screenshot_b64, str):
-                        screenshot_b64 = base64.b64encode(screenshot_b64).decode() if isinstance(screenshot_b64, bytes) else None
-                    
-                    if screenshot_b64:
-                        # Emitir screenshot por WebSocket
-                        await manager.send(session_id, {
-                            "tipo": "screenshot",
-                            "screenshot": screenshot_b64,
-                            "url": getattr(state, "url", "") or sess.current_url,
-                        })
-                        
-                        # Log cada screenshot emitido (opcional, quitar si es muy verbose)
-                        logger.debug(f"📸 Screenshot emitido para {session_id}")
+            if not agent or not agent.browser_session:
+                await asyncio.sleep(1)
+                continue
+            
+            try:
+                # ── Obtener la página actual de Playwright ──
+                page = await agent.browser_session.get_current_page()
+                if page:
+                    try:
+                        # Capturar screenshot DIRECTO de Playwright
+                        screenshot_bytes = await page.screenshot(full_page=False, timeout=5000)
+                        if screenshot_bytes:
+                            screenshot_b64 = base64.b64encode(screenshot_bytes).decode()
+                            
+                            # Emitir screenshot por WebSocket
+                            try:
+                                url = await page.url
+                            except:
+                                url = sess.current_url or ""
+                            
+                            await manager.send(session_id, {
+                                "tipo": "screenshot",
+                                "screenshot": screenshot_b64,
+                                "url": url,
+                            })
+                            logger.debug(f"📸 Screenshot emitido: {len(screenshot_b64)} chars base64")
+                    except asyncio.TimeoutError:
+                        logger.debug(f"⚠️ Screenshot timeout (página lenta)")
+                    except Exception as e:
+                        logger.debug(f"⚠️ Error tomando screenshot: {type(e).__name__}: {e}")
+            except Exception as e:
+                logger.debug(f"⚠️ Error obteniendo página: {type(e).__name__}: {e}")
         except Exception as e:
             logger.debug(f"⚠️ Error en screenshot loop: {e}")
         
-        # Intervalo más rápido para UI responsiva (1.5s = ~0.67 fps)
-        await asyncio.sleep(1.5)
+        # Intervalo realista para captura (2s = 0.5 fps es suficiente para UI)
+        await asyncio.sleep(2.0)
 
 
 # ══════════════════════════════════════════════════════════════════
