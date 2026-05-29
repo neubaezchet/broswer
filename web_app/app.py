@@ -316,15 +316,21 @@ class BrowserUseLLMService:
     """
     Replica exacta del patrón BACKENDBETATWILEND/app/gemini_plano_service.py
     para seleccionar modelo Gemini disponible en startup.
+    
+    IMPORTANTE: Mayo 2026 - Modelos vigentes:
+    ✅ gemini-2.5-flash (RECOMENDADO - API estable)
+    ✅ gemini-3-flash-preview (Más nuevo - use si 2.5 falla)
+    ✅ gemini-1.5-flash (Fallback)
+    ❌ gemini-2.0-flash (DEPRECATED - 404 NOT_FOUND)
     """
     
-    # Misma lista de modelos que backend
+    # Lista de fallback - SOLO MODELOS VIGENTES EN 2026
     MODELS_FALLBACK = [
         os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),  # allow env override
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-8b",
+        "gemini-2.5-flash",          # PRIMARY (stable, available)
+        "gemini-3-flash-preview",    # FALLBACK 1 (newer model)
+        "gemini-1.5-flash",          # FALLBACK 2
+        "gemini-1.5-flash-8b",       # FALLBACK 3 (lightweight)
     ]
     MODELS_FALLBACK = list(dict.fromkeys(MODELS_FALLBACK))  # Remove dups, keep order
     
@@ -692,10 +698,12 @@ INSTRUCCIONES CRÍTICAS:
         sess.running = False
         return
 
+    # IMPORTANTE: Browser-Use 0.12.9 NO soporta fallback_llm nativamente
+    # Solo pasamos el LLM principal al Agent
     agent = Agent(
         task=task_final,
-        llm=llm,
-        fallback_llm=fallback_llm,  # ← CRITICAL: Auto-retry con modelo alterno si 503
+        llm=llm,  # ← Solo LLM principal
+        # NO PASAR fallback_llm (no es parámetro nativo)
         browser_profile=profile,
         system_prompt=SYSTEM_PROMPT,  # ← SYSTEM PROMPT MEJORADO
         register_new_step_callback=on_step,
@@ -710,7 +718,7 @@ INSTRUCCIONES CRÍTICAS:
 
     try:
         await _emit("info", "🌐 Abriendo navegador...")
-        logger.info(f"🚀 Iniciando agente | Modelo: {llm.model} | Task: {task[:100]}")
+        logger.info(f"🚀 Iniciando agente | Modelo: {llm.model} | Fallback: {fallback_llm.model if fallback_llm else 'None'}")
         
         await agent.run(max_steps=30)
         
