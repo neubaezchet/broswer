@@ -313,78 +313,95 @@ def save_task(entry: dict):
 # Screenshot loop — pantalla en vivo entre pasos del agente
 # ══════════════════════════════════════════════════════════════════
 
-async def _create_llm_with_fallback() -> ChatGoogle:
+# ── Clase singleton para LLM (exactamente como GeminiPlanoService en backend) ──────
+class BrowserUseLLMService:
     """
-    CRITICAL: Browser-Use LLM selection con fallback automático.
-    
-    Replicated from BACKENDBETATWILEND/app/gemini_plano_service.py.
-    Intenta modelos en orden: gemini-2.5-flash → gemini-2.0-flash → gemini-1.5-flash
+    Replica exacta del patrón BACKENDBETATWILEND/app/gemini_plano_service.py
+    para seleccionar modelo Gemini disponible en startup.
     """
-    # ── Validación de API Key ──
-    if not GOOGLE_API_KEY:
-        raise ValueError(
-            "❌ GOOGLE_API_KEY no configurada.\n"
-            "   Configura en Railway: Settings → Variables → GEMINI_API_KEY=sk-...\n"
-            "   O en local: export GEMINI_API_KEY=tu-clave"
-        )
     
-    # ── Lista de modelos a intentar (en orden, mismo que backend) ──
-    MODELS_TO_TRY = [
-        os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),  # env override si existe
+    # Misma lista de modelos que backend
+    MODELS_FALLBACK = [
+        os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),  # allow env override
         "gemini-2.5-flash",
         "gemini-2.0-flash",
         "gemini-1.5-flash",
         "gemini-1.5-flash-8b",
     ]
-    MODELS_TO_TRY = list(dict.fromkeys(MODELS_TO_TRY))  # Remove duplicates, keep order
+    MODELS_FALLBACK = list(dict.fromkeys(MODELS_FALLBACK))  # Remove dups, keep order
     
-    # ── Monkeypatch: Inyectar modelo en Agent.__init__ ──
+    def __init__(self):
+        """Inicializar: detectar modelo disponible en startup (como backend)."""
+        if not GOOGLE_API_KEY:
+            raise ValueError(
+                "❌ GOOGLE_API_KEY no configurada.\n"
+                "   Configura en Railway: GEMINI_API_KEY=sk-...\n"
+                "   O en local: export GEMINI_API_KEY=tu-clave"
+            )
+        
+        # Detectar modelo disponible (en startup, no en cada llamada)
+        self.model = self._detectar_modelo_disponible()
+        logger.info(f"✅ BrowserUseLLMService listo. Modelo: {self.model}")
+    
+    def _detectar_modelo_disponible(self) -> str:
+        """Prueba modelos en startup, retorna el primero disponible (como backend)."""
+        for modelo in self.MODELS_FALLBACK:
+            try:
+                logger.info(f"🔍 Probando modelo: {modelo}")
+                llm = ChatGoogle(model=modelo, api_key=GOOGLE_API_KEY)
+                logger.info(f"✅ Modelo '{modelo}' disponible")
+                return modelo
+            except Exception as e:
+                err_str = str(e)
+                is_not_available = (
+                    "404" in err_str or 
+                    "NOT_FOUND" in err_str or 
+                    "not available" in err_str or 
+                    "no longer available" in err_str
+                )
+                
+                if is_not_available:
+                    logger.warning(f"⚠️ Modelo '{modelo}' no disponible (404), probando siguiente...")
+                    continue
+                else:
+                    logger.warning(f"⚠️ Modelo '{modelo}' error: {e}, probando siguiente...")
+                    continue
+        
+        logger.error(f"❌ Ningún modelo disponible. Retornando '{self.MODELS_FALLBACK[0]}' como fallback final.")
+        return self.MODELS_FALLBACK[0]
+    
+    def get_llm(self) -> ChatGoogle:
+        """Retorna una instancia de ChatGoogle con el modelo detectado."""
+        return ChatGoogle(model=self.model, api_key=GOOGLE_API_KEY)
+
+
+# ── Instancia global (como gemini_plano en backend) ──────────────────────────
+try:
+    llm_service = BrowserUseLLMService()
+except Exception as e:
+    logger.error(f"❌ Error inicializando BrowserUseLLMService: {e}")
+    llm_service = None
+
+
+def _get_llm_for_agent() -> ChatGoogle:
+    """Obtener LLM para el agente (usa modelo detectado en startup)."""
+    if llm_service is None:
+        raise ValueError("❌ LLM no inicializado. Verifica GEMINI_API_KEY.")
+    
+    # Monkeypatch Browser-Use Agent para usar nuestro modelo
     import browser_use.agent.service
     original_init = browser_use.agent.service.Agent.__init__
     
-    selected_model = None
+    active_model = llm_service.model
     
     def patched_init(agent_self, *args, **kwargs):
-        nonlocal selected_model
         if 'llm' not in kwargs and len(args) < 2:
             from browser_use.llm.google.chat import ChatGoogle as BUChatGoogle
-            kwargs['llm'] = BUChatGoogle(model=selected_model, api_key=GOOGLE_API_KEY)
+            kwargs['llm'] = BUChatGoogle(model=active_model, api_key=GOOGLE_API_KEY)
         return original_init(agent_self, *args, **kwargs)
     
-    # ── Intentar cada modelo en orden ──
-    for model in MODELS_TO_TRY:
-        try:
-            logger.info(f"🔍 Probando modelo: {model}")
-            selected_model = model
-            llm = ChatGoogle(model=model, api_key=GOOGLE_API_KEY)
-            
-            # Verificar que el modelo responda
-            # (ChatGoogle no prueba la conexión en __init__, pero Browser-Use sí lo hará)
-            logger.info(f"✅ Modelo '{model}' seleccionado y listo")
-            browser_use.agent.service.Agent.__init__ = patched_init
-            return llm
-            
-        except Exception as e:
-            error_msg = str(e).lower()
-            is_not_available = (
-                "404" in str(e) or 
-                "not_found" in error_msg or 
-                "not available" in error_msg or 
-                "no longer available" in error_msg
-            )
-            
-            if is_not_available:
-                logger.warning(f"⚠️ Modelo '{model}' no disponible (404), probando siguiente...")
-                continue
-            else:
-                logger.warning(f"⚠️ Modelo '{model}' error: {e}, probando siguiente...")
-                continue
-    
-    # ── Fallback final: si ninguno funciona, retorna el primero (Railway lo reintentatá) ──
-    logger.error(f"❌ Ningún modelo Gemini funcionó. Retornando {MODELS_TO_TRY[0]} como última opción.")
-    selected_model = MODELS_TO_TRY[0]
     browser_use.agent.service.Agent.__init__ = patched_init
-    return ChatGoogle(model=MODELS_TO_TRY[0], api_key=GOOGLE_API_KEY)
+    return llm_service.get_llm()
 
 
 async def _screenshot_loop(session_id: str):
@@ -653,9 +670,9 @@ INSTRUCCIONES CRÍTICAS:
 """
 
     # ── Crear y correr el agente ───────────────────────────────
-    # Usar LLM con fallback automático (evita crashes por modelos deprecated)
+    # Usar LLM detectado en startup (modelo seleccionado automáticamente)
     try:
-        llm = await _create_llm_with_fallback()
+        llm = _get_llm_for_agent()
     except ValueError as e:
         await _emit("error", f"❌ Error de configuración: {str(e)}")
         sess.running = False
