@@ -58,14 +58,15 @@ WORKDIR /app
 # Copiar primero solo el manifiesto para cachear deps
 COPY pyproject.toml uv.lock* ./
 
-# Primera pasada: instalar dependencias sin el código fuente
-RUN uv sync --no-install-project || uv sync
+# Instalar todas las dependencias declaradas en pyproject.toml (fastapi, uvicorn, httpx, etc.)
+# --no-install-project: no intenta compilar el paquete local (browser_use/ fue eliminado del repo)
+RUN uv sync --no-install-project
 
-# Copiar el código
+# Instalar browser-use desde PyPI ya que el directorio fuente local no existe en el repo
+RUN uv pip install "browser-use==0.12.9"
+
+# Copiar el código de la web app
 COPY . .
-
-# Segunda pasada: instalar el paquete browser-use desde fuente + todas las deps
-RUN uv sync
 
 # ── Carpetas necesarias ────────────────────────────────────────────────────────
 RUN mkdir -p /app/web_app/uploads
