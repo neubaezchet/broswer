@@ -38,10 +38,16 @@ from browser_use.browser.views import BrowserStateSummary
 from browser_use.agent.views import AgentHistoryList, AgentOutput
 
 # ── Módulos extendidos ──────────────────────────────────────────
-from modules.site_mapper import map_portal, load_portal_map
+from modules.site_mapper import map_portal, load_portal_map, install_network_interceptor
 from modules.console_executor import execute_direct_api, execute_form_function
 from modules.session_pool import SessionPool
 from modules.session_manager import SessionManager
+from modules.diagnostics import run_diagnostics, get_strategy_config
+from modules.captcha_solver import handle_captcha, solve as solve_captcha_v2
+from modules.smart_executor import dismiss_blocking_element
+from modules.portal_memory import portal_memory
+from modules.shadow_recorder import start_shadow, stop_shadow, is_shadow_active
+from modules.supervisor_agent import supervisor
 from database import init_db, SessionLocal
 from models.portals import Portal
 
@@ -170,122 +176,8 @@ sessions: dict[str, AgentSession] = {}
 # CapSolver helper
 # ══════════════════════════════════════════════════════════════════
 
-async def solve_captcha(captcha_type: str, site_key: str, page_url: str) -> str | None:
-    """
-    Resuelve CAPTCHA via CapSolver API. Retorna None si no hay API key o falla.
-    
-    Soporta:
-    - reCAPTCHA v2 (checkbox)
-    - reCAPTCHA v3 (invisible)
-    - hCaptcha
-    """
-    if not CAPSOLVER_API_KEY:
-        logger.warning("⚠️ CAPSOLVER_API_KEY no configurada. CAPTCHAs no serán resueltos.")
-        return None
-    
-    task_types = {
-        "recaptchav2": "ReCaptchaV2TaskProxyless",
-        "recaptchav3": "ReCaptchaV3TaskProxyless",
-        "hcaptcha":    "HCaptchaTaskProxyless",
-    }
-    task_type = task_types.get(captcha_type.lower(), "ReCaptchaV2TaskProxyless")
-    
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            logger.info(f"🔐 Enviando CAPTCHA a CapSolver: {captcha_type}")
-            
-            # Crear tarea
-            r = await client.post("https://api.capsolver.com/createTask", json={
-                "clientKey": CAPSOLVER_API_KEY,
-                "task": {"type": task_type, "websiteURL": page_url, "websiteKey": site_key},
-            })
-            data = r.json()
-            task_id = data.get("taskId")
-            
-            if not task_id:
-                logger.error(f"❌ CapSolver error: {data}")
-                return None
-            
-            logger.info(f"⏳ Esperando resolución de CAPTCHA (ID: {task_id})")
-            
-            # Esperar resultado (máx 60s)
-            for attempt in range(30):
-                await asyncio.sleep(2)
-                r2 = await client.post("https://api.capsolver.com/getTaskResult", json={
-                    "clientKey": CAPSOLVER_API_KEY,
-                    "taskId": task_id,
-                })
-                result = r2.json()
-                
-                if result.get("status") == "ready":
-                    solution = result.get("solution", {}).get("gRecaptchaResponse")
-                    if solution:
-                        logger.info(f"✅ CAPTCHA resuelto en {(attempt + 1) * 2}s")
-                        return solution
-                    
-            logger.warning("⚠️ Timeout esperando resolución de CAPTCHA")
-            return None
-    except Exception as e:
-        logger.error(f"❌ Error resolviendo CAPTCHA: {e}")
-        return None
-
-
-async def inject_captcha_solution(browser_session: Any, solution: str, captcha_type: str) -> bool:
-    """
-    Inyecta la solución del CAPTCHA en la página.
-    Funciona para reCAPTCHA v2 y v3, hCaptcha.
-    """
-    try:
-        page = getattr(browser_session, "_page", None) or getattr(browser_session, "page", None)
-        if not page:
-            logger.warning("⚠️ No hay página disponible para inyectar CAPTCHA")
-            return False
-        
-        logger.info(f"💉 Inyectando solución de {captcha_type}")
-        
-        # Para reCAPTCHA v2/v3
-        if "recaptcha" in captcha_type.lower():
-            await page.evaluate(f"""
-                () => {{
-                    document.getElementById('g-recaptcha-response').innerHTML = `{solution}`;
-                    if (typeof ___grecaptcha_cfg !== 'undefined') {{
-                        Object.entries(___grecaptcha_cfg.clients).forEach(([key, client]) => {{
-                            if (client.callback) {{
-                                client.callback(`{solution}`);
-                            }}
-                        }});
-                    }}
-                }}
-            """)
-        # Para hCaptcha
-        elif "hcaptcha" in captcha_type.lower():
-            await page.evaluate(f"""
-                () => {{
-                    if (typeof hcaptcha !== 'undefined') {{
-                        hcaptcha.getResponse().then(token => {{
-                            document.getElementById('h-captcha-response').innerHTML = `{solution}`;
-                        }});
-                    }}
-                }}
-            """)
-        
-        # Trigger submit si hay botón
-        await page.evaluate("""
-            () => {
-                const submitBtn = document.querySelector('button[type="submit"], input[type="submit"]');
-                if (submitBtn) {
-                    submitBtn.click();
-                    return true;
-                }
-                return false;
-            }
-        """)
-        
-        logger.info(f"✅ CAPTCHA inyectado correctamente")
-        return True
-    except Exception as e:
-        logger.warning(f"⚠️ Error inyectando CAPTCHA: {e}")
-        return False
+# solve_captcha e inject_captcha_solution reemplazados por modules/captcha_solver.py
+# Las funciones handle_captcha() y solve() de ese módulo se usan directamente en on_step.
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -497,6 +389,9 @@ async def _screenshot_loop(session_id: str):
 async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = None):
     """Corre el agente y hace streaming de cada paso via WebSocket."""
     sess = sessions[session_id]
+    
+    # 📊 Registrar en supervisor
+    supervisor.register_agent(session_id=session_id, task=task)
 
     async def _emit(tipo: str, mensaje: str, extra: dict | None = None):
         payload: dict[str, Any] = {
@@ -538,11 +433,63 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
         await _emit("info", f"📎 {len(pdf_paths)} PDF(s) adjunto(s) a la tarea")
 
     # ── Callbacks ──────────────────────────────────────────────
+    # Diagnóstico ejecutado una sola vez por sesión (al primer paso)
+    _diagnosis_done = {"done": False, "report": None}
+
+    async def _run_portal_diagnostics_once(page):
+        """Corre diagnóstico de seguridad la primera vez que el agente carga una página real."""
+        if _diagnosis_done["done"]:
+            return _diagnosis_done["report"]
+
+        try:
+            # Instalar interceptores de red
+            await install_network_interceptor(page)
+            # Diagnóstico completo
+            report = await run_diagnostics(page)
+            _diagnosis_done["done"] = True
+            _diagnosis_done["report"] = report
+
+            captcha_list = [c["type"] for c in report.get("captcha", [])]
+            antibot_list = [a["type"] for a in report.get("antibot", [])]
+            strategy = report.get("strategy", "basic_stealth")
+            forms_count = len(report.get("forms", []))
+
+            diag_msg = (
+                f"🕵️ Diagnóstico del portal:\n"
+                f"   CAPTCHA: {captcha_list or 'Ninguno'}\n"
+                f"   Anti-bot: {antibot_list or 'Ninguno'}\n"
+                f"   Framework: {report.get('framework', [])}\n"
+                f"   Formularios detectados: {forms_count}\n"
+                f"   Estrategia: {strategy}"
+            )
+            await _emit("info", diag_msg, {"diagnosis": report, "url": page.url})
+
+            return report
+        except Exception as e:
+            logger.warning(f"⚠️ Error en diagnóstico pre-portal: {e}")
+            return None
+
     async def on_step(browser_state: BrowserStateSummary, output: AgentOutput, step_n: int):
         sess.steps = step_n
-        # Extraer URL actual
         url = getattr(browser_state, "url", "") or ""
         sess.current_url = url
+
+        # 📊 Notificar al supervisor
+        supervisor.update_agent(
+            session_id=session_id,
+            step_current=step_n,
+            step_total=30,
+            status="running"
+        )
+
+        # 🕵️ PASO 1: Diagnóstico pre-portal (solo al inicio)
+        if step_n <= 2 and sess.agent and sess.agent.browser_session:
+            try:
+                page = await sess.agent.browser_session.get_current_page()
+                if page and page.url and not page.url.startswith("about:"):
+                    await _run_portal_diagnostics_once(page)
+            except Exception:
+                pass
 
         # Extraer info del paso
         state = output.current_state
@@ -550,7 +497,6 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
         memory     = getattr(state, "memory",     "") or ""
         evaluation = getattr(state, "evaluation_previous_goal", "") or ""
 
-        # Determinar tipo de log
         tipo = "action"
         if evaluation and "success" in evaluation.lower():
             tipo = "success"
@@ -561,43 +507,51 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
         if evaluation:
             mensaje = f"{evaluation} → {next_goal}" if next_goal else evaluation
 
-        # 🔐 DETECCIÓN AUTOMÁTICA DE CAPTCHA
+        # 🔐 DETECCIÓN Y RESOLUCIÓN REAL DE CAPTCHA
         captcha_keywords = ["captcha", "recaptcha", "hcaptcha", "robot", "verify", "check"]
         mensaje_lower = mensaje.lower() + (memory or "").lower()
-        
+
         if any(kw in mensaje_lower for kw in captcha_keywords):
             tipo = "warn"
-            mensaje = f"🔒 CAPTCHA detectado: {mensaje}"
-            logger.warning(f"🔒 CAPTCHA detectado en paso {step_n}: {mensaje}")
-            await _emit(tipo, mensaje, {
-                "step_n": step_n,
-                "url": url,
-                "captcha_detected": True,
-            })
-            
-            # Intentar resolver automáticamente si tenemos CapSolver
-            if CAPSOLVER_API_KEY:
-                await _emit("info", "🔐 Intentando resolver CAPTCHA con CapSolver...")
-                solution = await solve_captcha("recaptchav2", "dummy", url)
-                if solution:
-                    await _emit("success", "✅ CAPTCHA resuelto por CapSolver")
-                    # Inyectar en página
-                    if sess.agent and sess.agent.browser_session:
-                        await inject_captcha_solution(sess.agent.browser_session, solution, "recaptchav2")
-                else:
-                    await _emit("warn", "⚠️ No se pudo resolver CAPTCHA, esperando...")
-            else:
-                await _emit("warn", "⚠️ CAPSOLVER_API_KEY no configurada. No se puede resolver CAPTCHA.")
-        else:
-            # Log normal sin CAPTCHA
-            await _emit(tipo, mensaje, {
-                "step_n": step_n,
-                "url": url,
-                "memory": memory,
+            await _emit(tipo, f"🔒 CAPTCHA detectado en paso {step_n}: {mensaje}", {
+                "step_n": step_n, "url": url, "captcha_detected": True,
             })
 
-        # Delay aleatorio anti-detección (0.5s – 2s) entre pasos
-        await asyncio.sleep(random.uniform(0.5, 2.0))
+            if CAPSOLVER_API_KEY and sess.agent and sess.agent.browser_session:
+                await _emit("info", "🔐 Resolviendo CAPTCHA con CapSolver...")
+                try:
+                    page = await sess.agent.browser_session.get_current_page()
+                    if page:
+                        solved = await handle_captcha(page, CAPSOLVER_API_KEY)
+                        if solved:
+                            await _emit("success", "✅ CAPTCHA resuelto automáticamente")
+                        else:
+                            await _emit("warn", "⚠️ No se pudo resolver CAPTCHA — continuando sin solución")
+                except Exception as e:
+                    await _emit("warn", f"⚠️ Error resolviendo CAPTCHA: {e}")
+            else:
+                await _emit("warn", "⚠️ CAPSOLVER_API_KEY no configurada — CAPTCHA bloqueará la tarea")
+
+        # 🚧 DETECCIÓN DE ELEMENTOS BLOQUEANTES (modales, overlays)
+        elif any(kw in mensaje_lower for kw in ["modal", "popup", "overlay", "dialog", "blocked", "bloqueado"]):
+            await _emit("warn", f"🚧 Elemento bloqueante detectado — intentando desbloquear...", {
+                "step_n": step_n, "url": url,
+            })
+            if sess.agent and sess.agent.browser_session:
+                try:
+                    page = await sess.agent.browser_session.get_current_page()
+                    if page:
+                        unblocked = await dismiss_blocking_element(page)
+                        if unblocked:
+                            await _emit("success", "✅ Elemento bloqueante removido")
+                except Exception:
+                    pass
+
+        else:
+            await _emit(tipo, mensaje, {"step_n": step_n, "url": url, "memory": memory})
+
+        # Delay anti-detección entre pasos (distribución normal)
+        await asyncio.sleep(random.gauss(1.2, 0.4))
 
         # Screenshot para la pantalla en vivo
         screenshot = getattr(browser_state, "screenshot", None)
@@ -632,6 +586,9 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
             error_kw in resultado.lower() 
             for error_kw in ["error", "failed", "no se pudo", "unable"]
         )
+        
+        # 📊 Finalizar en supervisor
+        supervisor.finish_agent(session_id=session_id, success=success)
 
         if success:
             mensaje = f"✅ Completado: {resultado[:200]}"
@@ -664,8 +621,23 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
                 "exitoso": success,
                 "captcha": captcha_encontrado,
             })
-            msg = "Tarea guardada en historial"
-            await manager.send(session_id, {"tipo": "task_saved", "mensaje": msg})
+            await manager.send(session_id, {"tipo": "task_saved", "mensaje": "Tarea guardada en historial"})
+
+        # Guardar flujo en portal memory si fue exitoso
+        if success and sess.current_url:
+            try:
+                from urllib.parse import urlparse
+                portal_host = urlparse(sess.current_url).netloc
+                if portal_host:
+                    steps_summary = [{"step": i + 1} for i in range(sess.steps)]
+                    portal_memory.save_flow(
+                        portal=portal_host,
+                        task_description=task,
+                        steps=steps_summary,
+                        duration_seconds=float(sess.elapsed()),
+                    )
+            except Exception as _pm_err:
+                logger.debug(f"portal_memory save skipped: {_pm_err}")
 
     # ── System Prompt para potenciar el agente ────────────────────────
     SYSTEM_PROMPT = """
@@ -844,11 +816,41 @@ async def api_run(body: dict):
 async def api_stop(body: dict):
     session_id = body.get("session_id", "")
     sess = sessions.get(session_id)
-    if sess and sess.task and not sess.task.done():
+    if not sess:
+        return {"ok": False, "mensaje": "Sesión no encontrada"}
+
+    sess.running = False
+
+    # 1. Cerrar el navegador del agente antes de cancelar el task
+    if sess.agent:
+        try:
+            bs = getattr(sess.agent, "browser_session", None)
+            if bs:
+                # Intentar cerrar de forma limpia
+                if hasattr(bs, "close"):
+                    await bs.close()
+                elif hasattr(bs, "stop"):
+                    await bs.stop()
+        except Exception as e:
+            logger.warning(f"⚠️ Error cerrando browser en stop: {e}")
+
+    # 2. Cancelar el asyncio task
+    if sess.task and not sess.task.done():
         sess.task.cancel()
-        sess.running = False
-        return {"ok": True, "mensaje": "Agente detenido"}
-    return {"ok": False, "mensaje": "No hay agente activo"}
+        try:
+            await asyncio.wait_for(asyncio.shield(sess.task), timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass  # Esperado
+
+    # 3. Notificar al frontend por WebSocket
+    await manager.send(session_id, {
+        "tipo": "stopped",
+        "mensaje": "⏹ Agente detenido por el usuario",
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+    })
+
+    logger.info(f"⏹ Agente detenido: {session_id}")
+    return {"ok": True, "mensaje": "Agente detenido"}
 
 
 @app.post("/api/pause")
@@ -1127,5 +1129,72 @@ async def run_with_pdfs(body: dict):
     sess.task = task_obj
     
     logger.info(f"🚀 Tarea iniciada con {len(pdf_paths)} PDFs")
-    
+
     return {"ok": True, "session_id": session_id, "pdf_count": len(pdf_paths)}
+
+
+# ══════════════════════════════════════════════════════════════════
+# Shadow Mode — grabar acciones humanas y guardar como flujos
+# ══════════════════════════════════════════════════════════════════
+
+@app.post("/api/shadow/start")
+async def api_shadow_start(body: dict):
+    """Abre navegador visible y empieza a grabar acciones del usuario."""
+    if is_shadow_active():
+        return {"ok": False, "error": "Shadow recorder ya está activo"}
+    start_url = body.get("start_url", "about:blank")
+    ok, msg = await start_shadow(start_url)
+    return {"ok": ok, "mensaje": msg}
+
+
+@app.post("/api/shadow/stop")
+async def api_shadow_stop(body: dict):
+    """Detiene la grabación y guarda el flujo en portal memory."""
+    task_description = body.get("task_description", "").strip()
+    if not task_description:
+        return {"ok": False, "error": "task_description requerido"}
+    ok, actions, portal = await stop_shadow(task_description)
+    return {
+        "ok": ok,
+        "steps": len(actions),
+        "portal": portal,
+        "mensaje": f"Flujo '{task_description}' guardado ({len(actions)} acciones)" if ok else "Error",
+    }
+
+
+@app.get("/api/shadow/status")
+async def api_shadow_status():
+    return {"active": is_shadow_active()}
+
+
+# ══════════════════════════════════════════════════════════════════
+# Portal Memory — consultar flujos guardados
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/api/memory/flows")
+async def api_memory_flows(portal: str | None = None):
+    """Lista todos los flujos guardados, opcionalmente filtrados por portal."""
+    flows = portal_memory.list_flows(portal=portal)
+    return {"flows": flows, "total": len(flows)}
+
+
+@app.get("/api/memory/check")
+async def api_memory_check(portal: str, task: str):
+    """Verifica si existe un flujo conocido para este portal+tarea."""
+    flow = portal_memory.get_flow(portal=portal, task_description=task)
+    if flow:
+        return {
+            "found": True,
+            "step_count": flow["step_count"],
+            "run_count": flow["run_count"],
+            "duration_seconds": flow["duration_seconds"],
+            "last_used": flow["last_used"],
+        }
+    return {"found": False}
+
+
+@app.delete("/api/memory/portal/{portal}")
+async def api_memory_delete_portal(portal: str):
+    """Elimina todos los flujos de un portal."""
+    deleted = portal_memory.delete_portal(portal)
+    return {"ok": True, "deleted": deleted}
