@@ -222,20 +222,21 @@ class BrowserUseLLMService:
     para seleccionar modelo Gemini disponible en startup.
     
     IMPORTANTE: Mayo 2026 - Modelos vigentes:
-    ✅ gemini-2.0-pro (RECOMENDADO - Mejor razonamiento)
-    ✅ gemini-2.5-flash (RÁPIDO - API estable)
-    ✅ gemini-3-flash-preview (Más nuevo - use si 2.5 falla)
+    ✅ gemini-2.5-flash (PRIMARY - API estable, disponible)
+    ✅ gemini-1.5-pro (Mejor razonamiento)
+    ✅ gemini-3-flash-preview (Más nuevo)
     ✅ gemini-1.5-flash (Fallback)
+    ❌ gemini-2.0-pro (DEPRECATED - 404 NOT_FOUND)
     """
     
     # Lista de fallback - SOLO MODELOS VIGENTES EN 2026
     MODELS_FALLBACK = [
-        os.getenv("GEMINI_MODEL", "gemini-2.0-pro"),  # allow env override - CHANGED TO PRO
-        "gemini-2.0-pro",            # PRIMARY (best reasoning)
-        "gemini-2.5-flash",          # FALLBACK 1 (stable, available)
-        "gemini-3-flash-preview",    # FALLBACK 2 (newer model)
-        "gemini-1.5-flash",          # FALLBACK 3
-        "gemini-1.5-flash-8b",       # FALLBACK 4 (lightweight)
+        os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),  # allow env override
+        "gemini-3.5-flash",          # PRIMARY (Gemini 3 Flash con thinking, mejor razonamiento)
+        "gemini-3-flash-preview",    # FALLBACK 1 (Gemini 3 Flash con thinking)
+        "gemini-2.5-flash",          # FALLBACK 2 (dynamic thinking_budget)
+        "gemini-1.5-pro",            # FALLBACK 3
+        "gemini-1.5-flash",          # FALLBACK 4
     ]
     MODELS_FALLBACK = list(dict.fromkeys(MODELS_FALLBACK))  # Remove dups, keep order
     
@@ -253,44 +254,29 @@ class BrowserUseLLMService:
         logger.info(f"✅ BrowserUseLLMService listo. Modelo: {self.model}")
     
     def _detectar_modelo_disponible(self) -> str:
-        """Prueba modelos en startup, retorna el primero disponible (como backend)."""
+        """Prueba modelos haciendo una llamada real a la API — retorna el primero que responde."""
+        from google import genai as _genai
+        client = _genai.Client(api_key=GOOGLE_API_KEY)
         for modelo in self.MODELS_FALLBACK:
             try:
                 logger.info(f"🔍 Probando modelo: {modelo}")
-                llm = ChatGoogle(
-                    model=modelo, 
-                    api_key=GOOGLE_API_KEY,
-                    temperature=0.2,  # ← Bajo para razonamiento
-                    top_p=0.8,
-                )
+                # Llamada real para verificar que el modelo existe y responde
+                client.models.generate_content(model=modelo, contents="hi")
                 logger.info(f"✅ Modelo '{modelo}' disponible")
                 return modelo
             except Exception as e:
-                err_str = str(e)
-                is_not_available = (
-                    "404" in err_str or 
-                    "NOT_FOUND" in err_str or 
-                    "not available" in err_str or 
-                    "no longer available" in err_str
-                )
-                
-                if is_not_available:
-                    logger.warning(f"⚠️ Modelo '{modelo}' no disponible (404), probando siguiente...")
-                    continue
-                else:
-                    logger.warning(f"⚠️ Modelo '{modelo}' error: {e}, probando siguiente...")
-                    continue
-        
-        logger.error(f"❌ Ningún modelo disponible. Retornando '{self.MODELS_FALLBACK[0]}' como fallback final.")
-        return self.MODELS_FALLBACK[0]
+                logger.warning(f"⚠️ Modelo '{modelo}' no disponible: {str(e)[:120]}, probando siguiente...")
+                continue
+
+        logger.error(f"❌ Ningún modelo respondió. Usando '{self.MODELS_FALLBACK[-1]}' como último recurso.")
+        return self.MODELS_FALLBACK[-1]
     
     def get_llm(self) -> ChatGoogle:
         """Retorna una instancia de ChatGoogle con el modelo detectado."""
         return ChatGoogle(
-            model=self.model, 
+            model=self.model,
             api_key=GOOGLE_API_KEY,
-            temperature=0.2,  # ← BAJO para razonamiento más determinista
-            top_p=0.8,        # ← Reduce variabilidad
+            thinking_level="high",  # Máximo razonamiento (Gemini 3 Flash/Pro)
         )
 
 
@@ -334,7 +320,11 @@ def _get_fallback_llm() -> ChatGoogle | None:
         if modelo != current:
             try:
                 logger.info(f"🔄 Configurando fallback LLM: {modelo}")
-                return ChatGoogle(model=modelo, api_key=GOOGLE_API_KEY)
+                return ChatGoogle(
+                    model=modelo,
+                    api_key=GOOGLE_API_KEY,
+                    thinking_level="high",
+                )
             except Exception as e:
                 logger.warning(f"⚠️ Fallback model {modelo} error: {e}")
                 continue
@@ -781,7 +771,7 @@ Explica EXACTAMENTE qué se completó o por qué falló. Describe cada paso que 
 
     try:
         await _emit("info", "🌐 Abriendo navegador...")
-        logger.info(f"🚀 Iniciando agente | Modelo: {llm.model} | Temperatura: 0.2 (bajo para razonamiento) | Sistema: Chain-of-Thought mejorado")
+        logger.info(f"🚀 Iniciando agente | Modelo: {llm.model} | Thinking: high | Sistema: Chain-of-Thought mejorado")
         
         await agent.run(max_steps=30)
         
@@ -1007,7 +997,7 @@ async def api_config():
     return {
         "google_api_key": bool(GOOGLE_API_KEY),
         "capsolver_api_key": bool(CAPSOLVER_API_KEY),
-        "model": "gemini-3-flash-preview",
+        "model": llm_service.model if llm_service else "not configured",
         "headless": HEADLESS,
         "railway": IS_RAILWAY,
     }

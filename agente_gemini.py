@@ -30,7 +30,7 @@ async def main():
 
     agent = Agent(
         task=tarea,
-        llm=ChatGoogle(model="gemini-2.5-flash"),  # Mejor relación velocidad/costo
+        llm=ChatGoogle(model="gemini-3.5-flash", thinking_level="high"),  # Gemini 3 Flash con razonamiento máximo
         browser=browser,
     )
 
