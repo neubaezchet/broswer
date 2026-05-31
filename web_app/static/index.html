@@ -92,6 +92,50 @@ body { font-family: 'DM Sans', sans-serif; background: var(--bg); color: var(--t
 .stop-btn:active { transform: scale(0.97); }
 .stop-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
 
+/* CONTROL BUTTONS VISIBILITY */
+.running-controls-hidden { display: none !important; }
+.running-controls-visible { display: flex !important; }
+
+/* FLOATING CONTROL BUTTONS (Always visible backup) */
+.floating-controls {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  display: flex;
+  gap: 8px;
+  z-index: 9999;
+  background: rgba(17,17,27,0.95);
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.1);
+  backdrop-filter: blur(8px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+.floating-controls.visible {
+  opacity: 1;
+  pointer-events: all;
+}
+.floating-controls button {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+  font-family: 'DM Sans', sans-serif;
+}
+.floating-pause { color: var(--amber); border-color: rgba(242,169,59,0.5); background: rgba(242,169,59,0.15); }
+.floating-pause:hover { background: rgba(242,169,59,0.25); transform: scale(1.05); }
+.floating-stop { color: #f87171; border-color: rgba(239,68,68,0.5); background: rgba(239,68,68,0.15); }
+.floating-stop:hover { background: rgba(239,68,68,0.25); transform: scale(1.05); }
+
 /* DROPDOWN MENU (legacy, still used by keyboard shortcut menu if any) */
 .control-menu { display: none; position: absolute; bottom: 100%; right: 0; margin-bottom: 6px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; z-index: 100; min-width: 160px; box-shadow: 0 4px 12px rgba(0,0,0,0.2); }
 .control-menu.active { display: flex; flex-direction: column; }
@@ -374,14 +418,14 @@ select option { background: var(--bg2); }
               Ejecutar
             </button>
             <!-- Botones visibles cuando RUNNING -->
-            <div id="running-controls" style="display:none; gap:6px; align-items:center;">
+            <div id="running-controls" class="running-controls-hidden" style="gap:6px; align-items:center;">
               <button class="control-btn pause-btn" id="btn-pause" onclick="pauseAgent()">
                 <svg viewBox="0 0 16 16" fill="currentColor" width="12" height="12"><path d="M6 2h2v12H6V2zm4 0h2v12h-2V2z"/></svg>
-                <span id="pause-text">Pausar</span>
+                <span id="pause-text">⏸ Pausar</span>
               </button>
               <button class="stop-btn" id="btn-stop" onclick="terminateAgent()">
                 <svg viewBox="0 0 16 16" fill="currentColor" width="12" height="12"><rect x="3" y="3" width="10" height="10" rx="1"/></svg>
-                <span id="stop-text">Detener</span>
+                <span id="stop-text">⏹ Detener</span>
               </button>
             </div>
           </div>
@@ -623,6 +667,9 @@ function setStatus(s) {
   const btnCtrl = document.getElementById('running-controls');
   const btnStop = document.getElementById('btn-stop');
   const btnPause = document.getElementById('btn-pause');
+  const floatingCtrl = document.getElementById('floating-controls');
+
+  console.log(`🔄 setStatus('${s}')`);
 
   if (s === 'running') {
     sdot.className = 'status-dot running';
@@ -630,10 +677,15 @@ function setStatus(s) {
     badge.className = 'badge running';
     badge.textContent = 'En curso';
     btnRun.style.display = 'none';
-    btnCtrl.style.display = 'flex';
-    if (btnStop) { btnStop.disabled = false; document.getElementById('stop-text').textContent = 'Detener'; }
+    // Mostrar botones regulares
+    btnCtrl.classList.remove('running-controls-hidden');
+    btnCtrl.classList.add('running-controls-visible');
+    // Mostrar botones flotantes
+    floatingCtrl.classList.add('visible');
+    if (btnStop) { btnStop.disabled = false; document.getElementById('stop-text').textContent = '⏹ Detener'; }
     document.getElementById('fps-dot').className = '';
     document.getElementById('fps-txt').textContent = 'conectando...';
+    console.log('✅ Botones mostrados (running-controls + floating-controls)');
   } else if (s === 'stopping') {
     sdot.className = 'status-dot running';
     stxt.textContent = 'Deteniendo...';
@@ -646,8 +698,12 @@ function setStatus(s) {
     badge.className = 'badge done';
     badge.textContent = 'Completado';
     btnRun.style.display = 'flex';
-    btnCtrl.style.display = 'none';
-    if (btnStop) { btnStop.disabled = false; document.getElementById('stop-text').textContent = 'Detener'; }
+    // Esconder botones regulares
+    btnCtrl.classList.remove('running-controls-visible');
+    btnCtrl.classList.add('running-controls-hidden');
+    // Esconder botones flotantes
+    floatingCtrl.classList.remove('visible');
+    if (btnStop) { btnStop.disabled = false; document.getElementById('stop-text').textContent = '⏹ Detener'; }
     if (btnPause) { document.getElementById('pause-text').textContent = 'Pausar'; }
     document.getElementById('fps-dot').className = '';
     document.getElementById('fps-txt').textContent = 'sin señal';
@@ -845,8 +901,12 @@ async function pauseAgent() {
     return;
   }
   agentPaused = true;
-  document.getElementById('pause-text').textContent = '▶ Reanudar';
+  // Actualizar texto en ambos botones
+  const pauseText = '▶ Reanudar';
+  document.getElementById('pause-text').textContent = pauseText;
+  document.getElementById('float-pause').textContent = '▶ Reanudar';
   document.getElementById('btn-pause').style.color = 'var(--green)';
+  document.getElementById('float-pause').style.color = 'var(--green)';
   document.getElementById('annotations-panel').style.display = 'block';
 
   await fetch('/api/pause', {
@@ -859,8 +919,12 @@ async function pauseAgent() {
 
 async function resumeAgent() {
   agentPaused = false;
-  document.getElementById('pause-text').textContent = 'Pausar';
+  // Restaurar texto en ambos botones
+  const pauseText = '⏸ Pausar';
+  document.getElementById('pause-text').textContent = pauseText;
+  document.getElementById('float-pause').textContent = pauseText;
   document.getElementById('btn-pause').style.color = '';
+  document.getElementById('float-pause').style.color = '';
   document.getElementById('annotations-panel').style.display = 'none';
 
   await fetch('/api/resume', {
@@ -944,6 +1008,20 @@ document.addEventListener('DOMContentLoaded', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: SESSION_ID, action: 'click', x, y })
     });
+  });
+
+  // ─── Atajos de teclado ─────────────────────────────────────
+  document.addEventListener('keydown', async (e) => {
+    // Espacio: Pausar/Reanudar (cuando el agente está ejecutando)
+    if (e.code === 'Space' && document.getElementById('running-controls').classList.contains('running-controls-visible')) {
+      e.preventDefault();
+      await pauseAgent();
+    }
+    // Escape: Detener agente (cuando está ejecutando)
+    if (e.key === 'Escape' && document.getElementById('running-controls').classList.contains('running-controls-visible')) {
+      e.preventDefault();
+      await terminateAgent();
+    }
   });
 
   connectWS();
@@ -1175,5 +1253,16 @@ function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 </script>
+
+<!-- Floating Control Buttons -->
+<div id="floating-controls" class="floating-controls">
+  <button id="float-pause" class="floating-pause" onclick="pauseAgent()" title="Pausar agente (Espace)">
+    <span>⏸</span> <span>Pausar</span>
+  </button>
+  <button id="float-stop" class="floating-stop" onclick="terminateAgent()" title="Detener agente (Escape)">
+    <span>⏹</span> <span>Detener</span>
+  </button>
+</div>
+
 </body>
 </html>

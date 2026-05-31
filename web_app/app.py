@@ -222,19 +222,20 @@ class BrowserUseLLMService:
     para seleccionar modelo Gemini disponible en startup.
     
     IMPORTANTE: Mayo 2026 - Modelos vigentes:
-    ✅ gemini-2.5-flash (RECOMENDADO - API estable)
+    ✅ gemini-2.0-pro (RECOMENDADO - Mejor razonamiento)
+    ✅ gemini-2.5-flash (RÁPIDO - API estable)
     ✅ gemini-3-flash-preview (Más nuevo - use si 2.5 falla)
     ✅ gemini-1.5-flash (Fallback)
-    ❌ gemini-2.0-flash (DEPRECATED - 404 NOT_FOUND)
     """
     
     # Lista de fallback - SOLO MODELOS VIGENTES EN 2026
     MODELS_FALLBACK = [
-        os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),  # allow env override
-        "gemini-2.5-flash",          # PRIMARY (stable, available)
-        "gemini-3-flash-preview",    # FALLBACK 1 (newer model)
-        "gemini-1.5-flash",          # FALLBACK 2
-        "gemini-1.5-flash-8b",       # FALLBACK 3 (lightweight)
+        os.getenv("GEMINI_MODEL", "gemini-2.0-pro"),  # allow env override - CHANGED TO PRO
+        "gemini-2.0-pro",            # PRIMARY (best reasoning)
+        "gemini-2.5-flash",          # FALLBACK 1 (stable, available)
+        "gemini-3-flash-preview",    # FALLBACK 2 (newer model)
+        "gemini-1.5-flash",          # FALLBACK 3
+        "gemini-1.5-flash-8b",       # FALLBACK 4 (lightweight)
     ]
     MODELS_FALLBACK = list(dict.fromkeys(MODELS_FALLBACK))  # Remove dups, keep order
     
@@ -256,7 +257,12 @@ class BrowserUseLLMService:
         for modelo in self.MODELS_FALLBACK:
             try:
                 logger.info(f"🔍 Probando modelo: {modelo}")
-                llm = ChatGoogle(model=modelo, api_key=GOOGLE_API_KEY)
+                llm = ChatGoogle(
+                    model=modelo, 
+                    api_key=GOOGLE_API_KEY,
+                    temperature=0.2,  # ← Bajo para razonamiento
+                    top_p=0.8,
+                )
                 logger.info(f"✅ Modelo '{modelo}' disponible")
                 return modelo
             except Exception as e:
@@ -280,7 +286,12 @@ class BrowserUseLLMService:
     
     def get_llm(self) -> ChatGoogle:
         """Retorna una instancia de ChatGoogle con el modelo detectado."""
-        return ChatGoogle(model=self.model, api_key=GOOGLE_API_KEY)
+        return ChatGoogle(
+            model=self.model, 
+            api_key=GOOGLE_API_KEY,
+            temperature=0.2,  # ← BAJO para razonamiento más determinista
+            top_p=0.8,        # ← Reduce variabilidad
+        )
 
 
 # ── Instancia global (como gemini_plano en backend) ──────────────────────────
@@ -685,47 +696,55 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
 
     # ── System Prompt para potenciar el agente ────────────────────────
     SYSTEM_PROMPT = """
-Eres un agente de automatización web experto. Tu objetivo es completar tareas web de forma rápida, precisa y resistente a errores.
+Eres un agente de automatización web experto en radicación de incapacidades médicas. Tu objetivo es completar tareas de forma PRECISA con RAZONAMIENTO EXPLÍCITO en cada paso.
 
-INSTRUCCIONES CRÍTICAS:
-1. ANÁLISIS ANTES DE ACTUAR
-   - Observa toda la página antes de hacer clicks
-   - Identifica formularios, botones, campos
-   - Planifica los pasos antes de ejecutar
+⚠️ CRÍTICO: RAZONA SIEMPRE ANTES DE ACTUAR
 
-2. LLENADO DE FORMULARIOS
-   - Lee TODOS los campos visibles
-   - Llena campos con datos lógicos y realistas
-   - Si un campo es obligatorio pero no tienes datos, intenta inferir del contexto
-   - Usa datos típicos: nombres reales, emails válidos, teléfonos realistas
+En cada paso DEBES:
+1. OBSERVAR: Toma screenshot, describe qué ves exactamente
+2. ANALIZAR: ¿Qué campo es este? ¿Cuál es el siguiente paso lógico?
+3. VERIFICAR: ¿El campo existe? ¿Está visible? ¿Es rellenable?
+4. ACTUAR: Rellena/clickea
+5. VALIDAR: ¿Se cambió? ¿Hay error? ¿Qué ves ahora?
 
-3. MANEJO DE ERRORES
-   - Si un campo rechaza tu entrada, intenta un formato diferente
-   - Si hay validaciones, adapta tu entrada
-   - Si hay error de red, espera y reintentar
-   - NO te rindas en el primer intento
+FLUJO PARA RADIAR INCAPACIDAD:
+Paso 1️⃣: Abre portal EPS (Sura/Compensar/COOMEVA/etc)
+Paso 2️⃣: Valida que estés logueado (¿Veo mi nombre en pantalla?)
+Paso 3️⃣: Busca "Radiar Incapacidad" o "Nueva Radicación"
+Paso 4️⃣: Busca al empleado por cédula (primer campo del formulario)
+Paso 5️⃣: Confirma datos personales (nombre, empresa, etc)
+Paso 6️⃣: Selecciona diagnóstico CIE-10 (desplegable o búsqueda)
+Paso 7️⃣: Ingresa fecha inicio de incapacidad
+Paso 8️⃣: Ingresa fecha fin de incapacidad
+Paso 9️⃣: Adjunta soportes PDF
+Paso 10️⃣: REVISA TODO ANTES DE ENVIAR (¿Todos los datos correctos?)
+Paso 11️⃣: Haz click en "Enviar"/"Radiar"/"Confirmar"
+Paso 12️⃣: Espera confirmación (¿Ves número de radicación?)
 
-4. NAVEGACIÓN
-   - Haz click en botones "Next", "Continue", "Submit" cuando sea necesario
-   - Maneja múltiples páginas de formularios
-   - Espera a que las páginas carguen completamente
+REGLAS DE ORO:
+❌ NUNCA hagas click en algo que NO viste claramente en pantalla
+❌ NUNCA supongas el nombre o la posición de un campo
+❌ NUNCA omitas campos obligatorios (llenarlos con datos realistas)
+✅ SIEMPRE toma screenshot antes y después de cada acción
+✅ SIEMPRE espera a que la página cargue completamente (2-3 segundos)
+✅ SIEMPRE describe tu razonamiento: "Veo el campo X, lo relleno con Y, ahora debo..."
 
-5. DETECCIÓN DE PROBLEMAS
-   - Si ves "CAPTCHA", "reCAPTCHA", "hCaptcha" → el sistema lo resolverá automáticamente
-   - Si ves "error", "invalid", "required" → análiza qué falta
-   - Si no puedes llenar un campo → reporta claramente qué pasó
+MANEJO DE ERRORES:
+- Si ves "CAPTCHA" → Se resolverá automáticamente, espera
+- Si ves "Required field" → Significa que es obligatorio, rellena con datos válidos
+- Si ves "Invalid format" → El formato está mal, intenta otro (ej: DD/MM/YYYY vs YYYY-MM-DD)
+- Si ves "User not found" → La cédula no existe, reporta el error
+- Si ves "Session expired" → Recarga la página y vuelve a iniciar sesión
+- Si un dropdown no abre → Intenta clickear en la flecha o bordes
 
-6. ÉXITO
-   - Una tarea se completó cuando:
-     a) Se envió un formulario exitosamente
-     b) Viste confirmación (página de "gracias", "success", número de referencia)
-     c) Recibiste un email de confirmación
-     d) Los datos aparecen en una siguiente página
+ÉXITO CONFIRMADO CUANDO:
+✅ Ves número de radicación (ej: "Radicación #REC-2026-12345")
+✅ Ves página de "Radicación exitosa"
+✅ Ves el formulario guardado en la lista de radicaciones
+✅ El sistema te solicita cualquier otra acción post-radicación
 
-7. REPORTE FINAL
-   - Reporta EXACTAMENTE qué se completó
-   - Si falló algo, explica qué error viste y por qué no pudiste continuar
-   - Si hubo CAPTCHA, menciona que fue resuelto
+REPORTE FINAL:
+Explica EXACTAMENTE qué se completó o por qué falló. Describe cada paso que hiciste.
 """
 
     # ── Crear y correr el agente ───────────────────────────────
@@ -740,12 +759,16 @@ INSTRUCCIONES CRÍTICAS:
 
     # IMPORTANTE: Browser-Use 0.12.9 NO soporta fallback_llm nativamente
     # Solo pasamos el LLM principal al Agent
+    # 🧠 CAMBIOS PARA MEJOR RAZONAMIENTO:
+    # - Modelo: Gemini 2.0-Pro (mejor razonamiento que Flash)
+    # - Temperature: 0.2 (menos alucinaciones, más determinista)
+    # - System Prompt: Chain-of-Thought con pasos explícitos
     agent = Agent(
         task=task_final,
-        llm=llm,  # ← Solo LLM principal
+        llm=llm,  # ← Gemini 2.0-Pro con temperature=0.2
         # NO PASAR fallback_llm (no es parámetro nativo)
         browser_profile=profile,
-        system_prompt=SYSTEM_PROMPT,  # ← SYSTEM PROMPT MEJORADO
+        system_prompt=SYSTEM_PROMPT,  # ← SYSTEM PROMPT MEJORADO CON CHAIN-OF-THOUGHT
         register_new_step_callback=on_step,
         register_done_callback=on_done,
         max_steps=30,
@@ -758,7 +781,7 @@ INSTRUCCIONES CRÍTICAS:
 
     try:
         await _emit("info", "🌐 Abriendo navegador...")
-        logger.info(f"🚀 Iniciando agente | Modelo: {llm.model} | Fallback: {fallback_llm.model if fallback_llm else 'None'}")
+        logger.info(f"🚀 Iniciando agente | Modelo: {llm.model} | Temperatura: 0.2 (bajo para razonamiento) | Sistema: Chain-of-Thought mejorado")
         
         await agent.run(max_steps=30)
         
