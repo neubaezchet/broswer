@@ -48,6 +48,10 @@ from modules.smart_executor import dismiss_blocking_element
 from modules.portal_memory import portal_memory
 from modules.shadow_recorder import start_shadow, stop_shadow, is_shadow_active
 from modules.supervisor_agent import supervisor
+from modules.capsolver_extension import (
+    setup_capsolver,
+    get_capsolver_extension_path,
+)
 from database import init_db, SessionLocal
 from models.portals import Portal
 
@@ -156,7 +160,9 @@ class AgentSession:
         self.start_time: float = 0
         self.current_url: str = ""
         self.session_id: str = ""
-        self.agent: Any = None   # referencia al Agent en ejecución
+        self.agent: Any = None
+        self.pause_event: asyncio.Event = asyncio.Event()  # set=corriendo, clear=pausado
+        self.human_actions: list[str] = []  # acciones grabadas mientras está pausado
 
     def reset(self, session_id: str):
         self.running = True
@@ -164,9 +170,15 @@ class AgentSession:
         self.start_time = time.time()
         self.current_url = ""
         self.session_id = session_id
+        self.pause_event.set()   # arrancar sin pausa
+        self.human_actions = []
 
     def elapsed(self) -> int:
         return int(time.time() - self.start_time) if self.start_time else 0
+
+    @property
+    def paused(self) -> bool:
+        return not self.pause_event.is_set()
 
 
 sessions: dict[str, AgentSession] = {}
@@ -408,6 +420,15 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
 
     await _emit("info", f"🚀 Iniciando agente para: {task}")
 
+    # ── Cargar CapSolver Extension ────────────────────────────
+    capsolver_path = None
+    try:
+        capsolver_path = get_capsolver_extension_path("chrome")
+        if capsolver_path:
+            logger.info(f"✅ CapSolver Extension cargada: {capsolver_path}")
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo cargar CapSolver: {e}")
+
     # ── Anti-detección via BrowserProfile ──────────────────────
     profile_kwargs: dict = {
         "user_agent": random.choice(USER_AGENTS),
@@ -421,6 +442,13 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
             "--disable-dev-shm-usage",       # Requerido en Railway/Docker
         ],
     }
+    
+    # Agregar extensión de CapSolver si está disponible
+    if capsolver_path:
+        abs_path = str(capsolver_path.resolve())
+        profile_kwargs["args"].append(f"--load-extension={abs_path}")
+        logger.info(f"🔧 CapSolver Extension inyectada: {abs_path}")
+    
     if CHROME_EXE:
         profile_kwargs["executable_path"] = CHROME_EXE
 
@@ -569,6 +597,22 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
                     "step_n": step_n,
                 })
                 logger.debug(f"📸 Screenshot emitido en paso {step_n}")
+
+        # ⏸ PAUSA: si el usuario pausó, bloqueamos aquí hasta que reanude.
+        # El navegador permanece abierto e interactivo vía /api/interact.
+        if sess.paused:
+            await _emit("info", "⏸ Agente pausado — tomá el control del navegador en vivo", {
+                "paused": True, "step_n": step_n,
+            })
+            await sess.pause_event.wait()   # bloquea hasta que resume
+            if sess.human_actions:
+                actions_str = " → ".join(sess.human_actions[-5:])
+                await _emit("action", f"▶ Reanudado. Acciones grabadas del usuario: {actions_str}", {
+                    "paused": False,
+                })
+                sess.human_actions.clear()
+            else:
+                await _emit("action", "▶ Agente reanudado", {"paused": False})
 
     async def on_done(history: AgentHistoryList):
         resultado = history.final_result() or ""
@@ -766,6 +810,22 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 
 
+# ── Startup: Inicializar CapSolver Extension ───────────────────
+@app.on_event("startup")
+async def startup_capsolver():
+    """Inicializa CapSolver en startup (una sola vez)."""
+    logger.info("🚀 Inicializando CapSolver Extension en startup...")
+    try:
+        success = setup_capsolver()
+        if success:
+            capsolver_path = get_capsolver_extension_path("chrome")
+            logger.info(f"✅ CapSolver Extension lista: {capsolver_path}")
+        else:
+            logger.warning("⚠️ CapSolver Extension no disponible (seguirá sin ella)")
+    except Exception as e:
+        logger.error(f"❌ Error inicializando CapSolver: {e}")
+
+
 @app.get("/")
 async def index():
     return FileResponse(str(STATIC_DIR / "index.html"))
@@ -855,32 +915,47 @@ async def api_stop(body: dict):
 
 @app.post("/api/pause")
 async def api_pause(body: dict):
-    """Pausa la ejecución del agente."""
+    """
+    Pausa el agente ENTRE pasos y habilita control manual del navegador.
+    El agente termina el paso actual y luego espera en on_step.
+    """
     session_id = body.get("session_id", "")
     sess = sessions.get(session_id)
-    if sess and sess.running:
-        sess.running = False
-        await manager.send(session_id, {
-            "tipo": "info",
-            "msg": "⏸️ Agente pausado - lista anotaciones activas"
-        })
-        return {"ok": True, "mensaje": "Agente pausado"}
-    return {"ok": False, "mensaje": "No hay agente activo"}
+    if not sess or not sess.running:
+        return {"ok": False, "mensaje": "No hay agente activo"}
+    if sess.paused:
+        return {"ok": False, "mensaje": "Ya está pausado"}
+
+    sess.pause_event.clear()   # señal de pausa
+    sess.human_actions = []
+    await manager.send(session_id, {
+        "tipo": "info",
+        "mensaje": "⏸ Pausando después del paso actual — podés interactuar con el navegador en vivo",
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "paused": True,
+    })
+    return {"ok": True, "mensaje": "Agente pausado"}
 
 
 @app.post("/api/resume")
 async def api_resume(body: dict):
-    """Reanuda la ejecución del agente."""
+    """Reanuda el agente. Cualquier clic hecho durante la pausa queda registrado."""
     session_id = body.get("session_id", "")
     sess = sessions.get(session_id)
-    if sess:
-        sess.running = True
-        await manager.send(session_id, {
-            "tipo": "success",
-            "msg": "▶️ Ejecución reanudada"
-        })
-        return {"ok": True, "mensaje": "Agente reanudado"}
-    return {"ok": False, "mensaje": "No hay sesión activa"}
+    if not sess:
+        return {"ok": False, "mensaje": "No hay sesión activa"}
+    if not sess.paused:
+        return {"ok": False, "mensaje": "El agente no está pausado"}
+
+    n_actions = len(sess.human_actions)
+    sess.pause_event.set()   # desbloquea on_step
+    await manager.send(session_id, {
+        "tipo": "success",
+        "mensaje": f"▶ Reanudando{'  (' + str(n_actions) + ' acción(es) tuyas grabadas)' if n_actions else ''}",
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "paused": False,
+    })
+    return {"ok": True, "mensaje": "Agente reanudado", "human_actions": n_actions}
 
 
 # ── Historial de tareas ────────────────────────────────────────
@@ -933,22 +1008,52 @@ async def api_interact(body: dict):
         bs = getattr(sess.agent, "browser_session", None)
         if bs:
             if action == "click":
-                # Método 1: execute_javascript
-                if hasattr(bs, "execute_javascript"):
-                    await bs.execute_javascript(
-                        f"(()=>{{const e=document.elementFromPoint({x},{y});if(e)e.click();}})()"
-                    )
-                    return {"ok": True}
-                # Método 2: Playwright mouse
-                page = getattr(bs, "_page", None) or getattr(bs, "page", None)
-                if page:
-                    await page.mouse.click(x, y)
-                    return {"ok": True}
+                # Intentar obtener el elemento clickeado para descripción
+                element_desc = f"({x},{y})"
+                try:
+                    page = await bs.get_current_page() if hasattr(bs, "get_current_page") else None
+                    if page:
+                        el_text = await page.evaluate(
+                            f"(()=>{{const e=document.elementFromPoint({x},{y});"
+                            f"return e?(e.innerText||e.getAttribute('aria-label')||e.tagName):'?';}})()"
+                        )
+                        if el_text and el_text != "?":
+                            element_desc = f"'{str(el_text).strip()[:40]}' en ({x},{y})"
+                        await page.mouse.click(x, y)
+                    elif hasattr(bs, "execute_javascript"):
+                        await bs.execute_javascript(
+                            f"(()=>{{const e=document.elementFromPoint({x},{y});if(e)e.click();}})()"
+                        )
+                except Exception:
+                    if hasattr(bs, "execute_javascript"):
+                        await bs.execute_javascript(
+                            f"(()=>{{const e=document.elementFromPoint({x},{y});if(e)e.click();}})()"
+                        )
+
+                # Registrar la acción si el agente está pausado
+                if sess.paused:
+                    sess.human_actions.append(f"clic en {element_desc}")
+                    await manager.send(session_id, {
+                        "tipo": "action",
+                        "mensaje": f"👆 Acción manual grabada: clic en {element_desc}",
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    })
+                return {"ok": True, "recorded": sess.paused}
+
             elif action == "type":
                 page = getattr(bs, "_page", None) or getattr(bs, "page", None)
                 if page:
                     await page.keyboard.type(text)
-                    return {"ok": True}
+                # Registrar si pausado
+                if sess.paused and text:
+                    sess.human_actions.append(f"escribió '{text[:30]}'")
+                    await manager.send(session_id, {
+                        "tipo": "action",
+                        "mensaje": f"⌨️ Texto grabado: '{text[:30]}'",
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    })
+                return {"ok": True}
+
     except Exception as e:
         logger.warning(f"interact error: {e}")
 

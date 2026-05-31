@@ -241,6 +241,27 @@ select option { background: var(--bg2); }
   color: var(--txt3); overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; text-align: center;
 }
+/* PAUSE OVERLAY */
+.pause-overlay {
+  display: none; position: absolute; inset: 0; z-index: 20;
+  background: rgba(251,191,36,0.08);
+  border: 2px solid var(--amber);
+  border-radius: 0;
+  pointer-events: none;
+  flex-direction: column; align-items: center; justify-content: flex-start;
+  padding-top: 8px; gap: 4px;
+}
+.pause-overlay.visible { display: flex; }
+.pause-overlay-badge {
+  background: var(--amber); color: #000; border-radius: 99px;
+  font-size: 10px; font-weight: 800; padding: 2px 10px;
+  letter-spacing: 0.05em; pointer-events: none;
+}
+.pause-overlay-hint {
+  font-size: 10px; color: var(--amber); opacity: 0.85; pointer-events: none;
+}
+.browser-screen.paused { cursor: pointer; }
+
 .browser-screen {
   flex: 1;
   position: relative;
@@ -415,6 +436,11 @@ select option { background: var(--bg2); }
           <div class="url-pill" id="browser-url">about:blank</div>
         </div>
         <div class="browser-screen" id="browser-screen">
+          <!-- Overlay visible cuando el agente está pausado -->
+          <div class="pause-overlay" id="pause-overlay">
+            <div class="pause-overlay-badge">⏸ MODO MANUAL</div>
+            <div class="pause-overlay-hint">Hacé clic en el navegador — tus acciones se graban</div>
+          </div>
           <img id="browser-img" alt="live browser">
           <div id="browser-placeholder">
             <svg fill="none" stroke-width="1.2" viewBox="0 0 36 36">
@@ -552,6 +578,24 @@ function handleMessage(d) {
   if (d.tipo === 'task_saved') loadHistory();
   // Actualizar tab de diagnóstico si viene info de diagnóstico
   if (d.diagnosis) renderDiagnosis(d.diagnosis);
+
+  // Mostrar/ocultar modo pausa
+  if (d.paused === true)  setPauseMode(true);
+  if (d.paused === false) setPauseMode(false);
+}
+
+function setPauseMode(on) {
+  const overlay = document.getElementById('pause-overlay');
+  const screen  = document.getElementById('browser-screen');
+  if (on) {
+    overlay.classList.add('visible');
+    screen.classList.add('paused');
+    // Navegar al panel del navegador automáticamente
+    switchTab('browser');
+  } else {
+    overlay.classList.remove('visible');
+    screen.classList.remove('paused');
+  }
 }
 
 // ─── Navegación ───────────────────────────────────────────────
@@ -610,6 +654,7 @@ function setStatus(s) {
     // reset pause state
     agentPaused = false;
     document.getElementById('annotations-panel').style.display = 'none';
+    setPauseMode(false);
   }
 }
 
