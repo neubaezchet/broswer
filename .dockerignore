@@ -24,10 +24,29 @@ venv/
 # Build Files
 dist/
 
-# Data files
+# Large files (non-essential)
 *.gif
 *.txt
 *.pdf
+
+# Browser extensions (extraídas localmente, se crearán en runtime)
+web_app/extensions/
+
+# CapSolver ZIPs (se usarán desde caché en runtime)
+*.zip
+*.tar.gz
+
+# Repositorios duplicados
+browser-use-main/
+browser-use-main.zip
+
+# Test files
+test_*.py
+verify_*.py
+
+# Node modules (si las hay)
+node_modules/
+
 *.csv
 *.json
 *.jsonl

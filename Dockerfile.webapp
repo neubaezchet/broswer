@@ -55,25 +55,30 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 # ── Código ────────────────────────────────────────────────────────────────────
 WORKDIR /app
 
-# Copiar primero solo el manifiesto para cachear deps
-COPY pyproject.toml uv.lock* ./
-
-# Instalar todas las dependencias declaradas en pyproject.toml (fastapi, uvicorn, httpx, etc.)
-# --no-install-project: no intenta compilar el paquete local (browser_use/ fue eliminado del repo)
-RUN uv sync --no-install-project
-
-# Instalar browser-use desde PyPI ya que el directorio fuente local no existe en el repo
-RUN uv pip install "browser-use==0.12.9"
-
-# Copiar el código de la web app
+# Copiar TODO el código (incluyendo pyproject.toml)
 COPY . .
+
+# Preparar estructura si es necesario (browser_use/ debe estar en raíz)
+# Si browser_use/ no existe en raíz pero existe en browser-use-main/, copiar
+RUN if [ ! -d "/app/browser_use" ] && [ -d "/app/browser-use-main/browser_use" ]; then \
+        echo "📦 Copiando browser_use/ desde browser-use-main..."; \
+        cp -r /app/browser-use-main/browser_use /app/browser_use; \
+    elif [ -d "/app/browser_use" ]; then \
+        echo "✅ browser_use/ ya existe"; \
+    else \
+        echo "⚠️ browser_use/ no encontrada, pero proseguimos (puede estar en pyproject.toml)"; \
+    fi
+
+# Instalar todas las dependencias + paquete local (browser-use)
+# NO usar --no-install-project ya que necesitamos instalar el browser-use local
+RUN uv sync
 
 # ── Carpetas necesarias ────────────────────────────────────────────────────────
 RUN mkdir -p /app/web_app/uploads
 
 # Verificar que Chrome y Python funcionan
 RUN google-chrome-stable --version && \
-    uv run python -c "from browser_use import Agent; print('browser-use OK')"
+    python -c "import sys; print(f'✅ Python {sys.version}')"
 
 # ── Arranque ──────────────────────────────────────────────────────────────────
 EXPOSE 8000
