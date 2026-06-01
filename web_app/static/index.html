@@ -431,18 +431,18 @@ select option { background: var(--bg2); }
           </div>
         </div>
         
-        <!-- ANOTACIONES DURANTE PAUSA -->
-        <div id="annotations-panel" style="display:none; margin-top:12px; padding:10px; background:var(--bg2); border:1px solid var(--border); border-radius:var(--radius-sm);">
-          <div style="font-size:11px; font-weight:600; color:var(--txt3); margin-bottom:8px;">📝 Anotaciones de Pausa</div>
-          <textarea id="annotations-input" placeholder="Escribe tus anotaciones aquí..." style="width:100%; height:80px; padding:8px; border:1px solid var(--border); border-radius:4px; background:var(--bg3); color:var(--txt); font-size:12px; resize:vertical; font-family:'DM Sans',sans-serif;"></textarea>
-          <div style="margin-top:8px; display:flex; gap:6px;">
-            <button onclick="saveAnnotation()" style="flex:1; padding:6px; background:var(--green-dim); color:var(--green); border:none; border-radius:4px; font-size:11px; font-weight:600; cursor:pointer;">
-              💾 Guardar
-            </button>
-            <button onclick="clearAnnotation()" style="flex:1; padding:6px; background:var(--bg3); color:var(--txt3); border:1px solid var(--border); border-radius:4px; font-size:11px; font-weight:600; cursor:pointer;">
-              Limpiar
+        <!-- CHAT CON EL BOT (visible cuando está corriendo o pausado) -->
+        <div id="guidance-panel" style="display:none; margin-top:12px; padding:10px; background:var(--bg2); border:1px solid var(--border); border-radius:var(--radius-sm);">
+          <div style="font-size:11px; font-weight:600; color:var(--txt3); margin-bottom:8px;">💬 Instrucción al bot — dile qué hacer ahora</div>
+          <div style="display:flex; gap:6px;">
+            <input id="guidance-input" placeholder='Ej: "haz clic en el botón Enviar" o "el usuario es 860000452"'
+              style="flex:1; padding:8px 10px; border:1px solid var(--border); border-radius:4px; background:var(--bg3); color:var(--txt); font-size:12px; font-family:'DM Sans',sans-serif; outline:none;"
+              onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendGuidance();}">
+            <button onclick="sendGuidance()" style="padding:8px 14px; background:var(--accent); color:#fff; border:none; border-radius:4px; font-size:12px; font-weight:600; cursor:pointer; white-space:nowrap;">
+              Enviar ↵
             </button>
           </div>
+          <div id="guidance-status" style="font-size:10px; color:var(--txt3); margin-top:5px; min-height:14px;"></div>
         </div>
       </div>
       
@@ -505,14 +505,18 @@ select option { background: var(--bg2); }
 
     <!-- ── CAMPOS ── -->
     <div class="panel" id="panel-fields">
-      <div class="sec-label">Campos detectados en el formulario</div>
+      <div class="sec-label">Campos llenados en el formulario</div>
       <div class="fields-wrap">
         <table class="fields-table">
-          <thead><tr><th>Campo</th><th>Tipo</th><th>Estado</th><th>Ejemplo</th></tr></thead>
+          <thead><tr><th>#</th><th>Campo</th><th>Valor ingresado</th><th>URL</th></tr></thead>
           <tbody id="ftbody">
-            <tr><td colspan="4" class="empty-state">Ejecuta una tarea para ver los campos detectados</td></tr>
+            <tr><td colspan="4" class="empty-state">Los campos llenados aparecen aquí en tiempo real</td></tr>
           </tbody>
         </table>
+      </div>
+      <div id="fields-json-wrap" style="display:none; margin-top:12px;">
+        <div style="font-size:11px; font-weight:600; color:var(--txt3); margin-bottom:6px;">JSON de reentrada</div>
+        <pre id="fields-json" style="font-size:10px; background:var(--bg2); padding:10px; border-radius:var(--radius-sm); border:1px solid var(--border); overflow:auto; max-height:220px; color:var(--txt2); margin:0;"></pre>
       </div>
     </div>
 
@@ -619,7 +623,28 @@ function handleMessage(d) {
 
   // Detectar fin de ejecución por tipo de mensaje
   if (['success','warn','error','stopped'].includes(d.tipo)) setStatus('idle');
-  if (d.tipo === 'task_saved') loadHistory();
+
+  // Campos de formulario llenados en tiempo real
+  if (d.tipo === 'form_field' && d.all_fields) {
+    updateFieldsTable(d.all_fields);
+  }
+
+  // Tarea guardada — actualizar historial y mostrar JSON de reentrada
+  if (d.tipo === 'task_saved') {
+    loadHistory();
+    if (d.form_fields && d.form_fields.length > 0) {
+      updateFieldsTable(d.form_fields);
+    }
+    if (d.reentry) {
+      const jsonWrap = document.getElementById('fields-json-wrap');
+      const jsonEl   = document.getElementById('fields-json');
+      if (jsonWrap && jsonEl) {
+        jsonEl.textContent = JSON.stringify(d.reentry, null, 2);
+        jsonWrap.style.display = 'block';
+      }
+    }
+  }
+
   // Actualizar tab de diagnóstico si viene info de diagnóstico
   if (d.diagnosis) renderDiagnosis(d.diagnosis);
 
@@ -634,12 +659,54 @@ function setPauseMode(on) {
   if (on) {
     overlay.classList.add('visible');
     screen.classList.add('paused');
-    // Navegar al panel del navegador automáticamente
     switchTab('browser');
   } else {
     overlay.classList.remove('visible');
     screen.classList.remove('paused');
   }
+}
+
+// ─── Guidance (instrucciones al bot en tiempo real) ───────────
+async function sendGuidance() {
+  const input = document.getElementById('guidance-input');
+  const status = document.getElementById('guidance-status');
+  const message = (input.value || '').trim();
+  if (!message) return;
+
+  status.textContent = '⏳ Enviando...';
+  try {
+    const r = await fetch('/api/guide', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: SESSION_ID, message })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      addLog({ tipo:'info', mensaje: `💬 Instrucción enviada: ${message}`, timestamp: tsNow() });
+      status.textContent = '✓ Enviado — el bot lo leerá en el próximo turno';
+      input.value = '';
+      setTimeout(() => { status.textContent = ''; }, 4000);
+    } else {
+      status.textContent = `✗ ${d.error || 'Error'}`;
+    }
+  } catch(e) {
+    status.textContent = '✗ Error de conexión';
+  }
+}
+
+// ─── Tabla de campos llenados (live) ─────────────────────────
+function updateFieldsTable(fields) {
+  const tbody = document.getElementById('ftbody');
+  if (!fields || fields.length === 0) return;
+  tbody.innerHTML = fields.map((f, i) => `
+    <tr>
+      <td style="color:var(--txt3);font-size:10px">${f.paso || i+1}</td>
+      <td>${escHtml(f.campo || '—')}</td>
+      <td style="font-family:'DM Mono',monospace;font-size:11px">${escHtml(String(f.valor || ''))}</td>
+      <td style="font-size:10px;color:var(--txt3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px" title="${escHtml(f.url||'')}">${escHtml((f.url||'').replace(/^https?:\/\//,'').substring(0,40))}</td>
+    </tr>`).join('');
+  // Auto-navegar a campos si hay algo nuevo
+  switchTab('fields');
 }
 
 // ─── Navegación ───────────────────────────────────────────────
@@ -671,20 +738,20 @@ function setStatus(s) {
 
   console.log(`🔄 setStatus('${s}')`);
 
+  const guidancePanel = document.getElementById('guidance-panel');
   if (s === 'running') {
     sdot.className = 'status-dot running';
     stxt.textContent = 'Ejecutando';
     badge.className = 'badge running';
     badge.textContent = 'En curso';
     btnRun.style.display = 'none';
-    // Mostrar botones regulares
     btnCtrl.classList.remove('running-controls-hidden');
     btnCtrl.classList.add('running-controls-visible');
-    // Mostrar botones flotantes
     floatingCtrl.classList.add('visible');
     if (btnStop) { btnStop.disabled = false; document.getElementById('stop-text').textContent = '⏹ Detener'; }
     document.getElementById('fps-dot').className = '';
     document.getElementById('fps-txt').textContent = 'conectando...';
+    if (guidancePanel) guidancePanel.style.display = 'block';
     console.log('✅ Botones mostrados (running-controls + floating-controls)');
   } else if (s === 'stopping') {
     sdot.className = 'status-dot running';
@@ -709,7 +776,7 @@ function setStatus(s) {
     document.getElementById('fps-txt').textContent = 'sin señal';
     // reset pause state
     agentPaused = false;
-    document.getElementById('annotations-panel').style.display = 'none';
+    if (guidancePanel) guidancePanel.style.display = 'none';
     setPauseMode(false);
   }
 }
@@ -959,26 +1026,7 @@ async function terminateAgent() {
   setStatus('idle');
 }
 
-// ─── Guardar anotación ────────────────────────────────────────
-function saveAnnotation() {
-  const text = document.getElementById('annotations-input').value;
-  if (!text.trim()) return;
-  
-  const ts = new Date().toLocaleTimeString();
-  agentAnnotations.push({ time: ts, text: text });
-  
-  addLog({
-    tipo: 'action',
-    msg: `📝 Anotación guardada: ${text.substring(0, 50)}...`
-  });
-  
-  document.getElementById('annotations-input').value = '';
-}
-
-// ─── Limpiar anotación ────────────────────────────────────────
-function clearAnnotation() {
-  document.getElementById('annotations-input').value = '';
-}
+// saveAnnotation / clearAnnotation eliminadas — reemplazadas por sendGuidance()
 
 // ─── Click en pantalla en vivo ────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
@@ -1039,18 +1087,56 @@ async function loadHistory() {
       list.innerHTML = '<div class="empty-state">No hay tareas guardadas todavía</div>';
       return;
     }
-    list.innerHTML = data.tasks.map(t => `
-      <div class="hist-item">
-        <div class="hist-ico"><svg fill="none" stroke-width="2" viewBox="0 0 16 16"><path stroke-linecap="round" stroke-linejoin="round" d="M3 8l4 4 6-6"/></svg></div>
-        <div class="hist-body">
-          <div class="hist-title">${escHtml(t.tarea || '')}</div>
-          <div class="hist-sub">${t.fecha ? new Date(t.fecha).toLocaleString('es-CO') : ''} · ${t.pasos || 0} pasos · ${t.duracion || 0}s</div>
+    list.innerHTML = data.tasks.map((t, i) => {
+      const ico = t.exitoso
+        ? `<svg fill="none" stroke-width="2" viewBox="0 0 16 16"><path stroke-linecap="round" stroke-linejoin="round" stroke="var(--green)" d="M3 8l4 4 6-6"/></svg>`
+        : `<svg fill="none" stroke-width="2" viewBox="0 0 16 16"><path stroke-linecap="round" stroke="var(--red)" d="M4 4l8 8M12 4l-8 8"/></svg>`;
+      const campos = t.form_fields && t.form_fields.length > 0
+        ? `<div style="font-size:10px;color:var(--txt3);margin-top:3px">📋 ${t.form_fields.length} campo(s) llenado(s): ${t.form_fields.map(f=>escHtml(f.campo)).join(', ')}</div>`
+        : '';
+      return `
+      <div class="hist-item" onclick="toggleHistDetail(${i})" style="cursor:pointer;flex-direction:column;align-items:stretch;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div class="hist-ico">${ico}</div>
+          <div class="hist-body" style="flex:1;min-width:0">
+            <div class="hist-title">${escHtml((t.tarea||'').substring(0,120))}</div>
+            <div class="hist-sub">${t.fecha ? new Date(t.fecha).toLocaleString('es-CO') : ''} · ${t.pasos||0} pasos · ${t.duracion||0}s · ${escHtml(t.modelo||'')}</div>
+            ${campos}
+          </div>
+          <div class="chev" id="hist-chev-${i}">▼</div>
         </div>
-        <div class="chev"><svg fill="none" stroke-width="2" viewBox="0 0 16 16"><path stroke-linecap="round" d="M6 4l4 4-4 4"/></svg></div>
-      </div>`).join('');
+        <div id="hist-detail-${i}" style="display:none;margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">
+          ${t.resultado ? `<div style="font-size:12px;color:var(--txt2);margin-bottom:8px;padding:8px;background:var(--bg2);border-radius:4px;">${escHtml(t.resultado)}</div>` : ''}
+          ${t.reentry ? `
+            <div style="font-size:11px;font-weight:600;color:var(--txt3);margin-bottom:4px;">📌 JSON de reentrada</div>
+            <pre style="font-size:10px;background:var(--bg2);padding:8px;border-radius:4px;border:1px solid var(--border);overflow:auto;max-height:180px;color:var(--txt2);margin:0 0 8px">${escHtml(JSON.stringify(t.reentry,null,2))}</pre>
+          ` : ''}
+          ${t.form_fields && t.form_fields.length > 0 ? `
+            <div style="font-size:11px;font-weight:600;color:var(--txt3);margin-bottom:4px;">📋 Campos llenados</div>
+            <table class="fields-table" style="margin-bottom:8px">
+              <thead><tr><th>#</th><th>Campo</th><th>Valor</th></tr></thead>
+              <tbody>${t.form_fields.map((f,j)=>`<tr><td style="color:var(--txt3)">${f.paso||j+1}</td><td>${escHtml(f.campo||'')}</td><td style="font-family:'DM Mono',monospace;font-size:10px">${escHtml(String(f.valor||''))}</td></tr>`).join('')}</tbody>
+            </table>
+          ` : ''}
+          ${t.action_log && t.action_log.length > 0 ? `
+            <div style="font-size:11px;font-weight:600;color:var(--txt3);margin-bottom:4px;">🔍 Log de acciones (${t.action_log.length})</div>
+            <pre style="font-size:9px;background:var(--bg2);padding:8px;border-radius:4px;border:1px solid var(--border);overflow:auto;max-height:150px;color:var(--txt3);margin:0">${escHtml(JSON.stringify(t.action_log,null,2))}</pre>
+          ` : ''}
+        </div>
+      </div>`;
+    }).join('');
   } catch (e) {
     document.getElementById('hist-list').innerHTML = '<div class="empty-state">Error cargando historial</div>';
   }
+}
+
+function toggleHistDetail(i) {
+  const detail = document.getElementById(`hist-detail-${i}`);
+  const chev   = document.getElementById(`hist-chev-${i}`);
+  if (!detail) return;
+  const open = detail.style.display !== 'none';
+  detail.style.display = open ? 'none' : 'block';
+  if (chev) chev.textContent = open ? '▼' : '▲';
 }
 
 // ─── Config ───────────────────────────────────────────────────
