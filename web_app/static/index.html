@@ -595,7 +595,21 @@ function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws/${SESSION_ID}`);
   ws.onmessage = e => handleMessage(JSON.parse(e.data));
+  ws.onopen    = () => syncRunningState();   // al reconectar, restaurar estado
   ws.onclose   = () => setTimeout(connectWS, 2000);
+}
+
+// Al reconectar el WS, verifica si el agente sigue corriendo y restaura UI
+async function syncRunningState() {
+  try {
+    const r = await fetch(`/api/status/${SESSION_ID}`);
+    const d = await r.json();
+    if (d.running) {
+      setStatus('running');
+      if (d.url) document.getElementById('browser-url').textContent = d.url;
+      if (d.steps) document.getElementById('browser-step').textContent = 'paso ' + d.steps;
+    }
+  } catch(e) {}
 }
 
 function handleMessage(d) {

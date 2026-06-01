@@ -544,6 +544,10 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
 
     # ── Callbacks ────────────────────────────────────────────────
     async def on_step(browser_state: BrowserStateSummary, output: AgentOutput, step_n: int):
+        # ── Si el usuario paró, abortar inmediatamente ────────────
+        if not sess.running:
+            raise asyncio.CancelledError("Detenido por el usuario")
+
         sess.steps = step_n
         url = getattr(browser_state, "url", "") or ""
         sess.current_url = url
@@ -585,17 +589,43 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
             if CAPSOLVER_API_KEY and sess.agent and sess.agent.browser_session:
                 await _emit("info", "🔐 Resolviendo CAPTCHA con CapSolver API...")
                 try:
-                    page = await sess.agent.browser_session.get_current_page()
-                    if page:
-                        solved = await handle_captcha(page, CAPSOLVER_API_KEY)
-                        if solved:
-                            await _emit("success", "✅ CAPTCHA resuelto automáticamente")
+                    cpage = await sess.agent.browser_session.get_current_page()
+                    if cpage:
+                        # Detección directa sin depender de diagnostics.py (que puede fallar)
+                        captcha_info = await cpage.evaluate("""
+                            () => {
+                                // reCAPTCHA v2 iframe
+                                const iframe = document.querySelector('iframe[src*="recaptcha/api2"]');
+                                if (iframe) {
+                                    const m = iframe.src.match(/[?&]k=([^&]+)/);
+                                    return m ? {type:'recaptcha_v2', site_key:m[1]} : null;
+                                }
+                                // reCAPTCHA div
+                                const div = document.querySelector('.g-recaptcha,[data-sitekey]');
+                                if (div) return {type:'recaptcha_v2', site_key: div.getAttribute('data-sitekey')};
+                                // hCaptcha
+                                const hc = document.querySelector('[data-hcaptcha-sitekey],.h-captcha');
+                                if (hc) return {type:'hcaptcha', site_key: hc.getAttribute('data-sitekey') || hc.getAttribute('data-hcaptcha-sitekey')};
+                                return null;
+                            }
+                        """)
+                        if captcha_info and captcha_info.get("site_key"):
+                            from modules.captcha_solver import solve as capsolver_solve, inject as capsolver_inject
+                            token = await capsolver_solve(
+                                captcha_info["type"], captcha_info["site_key"],
+                                cpage.url, CAPSOLVER_API_KEY
+                            )
+                            if token:
+                                await capsolver_inject(cpage, token, captcha_info["type"])
+                                await _emit("success", "✅ CAPTCHA resuelto e inyectado")
+                            else:
+                                await _emit("warn", "⚠️ CapSolver no pudo resolver el token")
                         else:
-                            await _emit("warn", "⚠️ CapSolver no pudo resolver — el bot intentará continuar")
+                            await _emit("warn", "⚠️ CAPTCHA en pantalla pero no se encontró site_key — el bot intentará continuar")
                 except Exception as ce:
                     await _emit("warn", f"⚠️ Error CapSolver: {ce}")
             else:
-                await _emit("warn", "⚠️ CAPSOLVER_API_KEY no configurada — CAPTCHA puede bloquear la tarea")
+                await _emit("warn", "⚠️ CAPSOLVER_API_KEY no configurada — CAPTCHA bloqueará la tarea")
         else:
             await _emit(tipo, mensaje, {"step_n": step_n, "url": url, "memory": memory})
 
@@ -634,6 +664,9 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
         if sess.paused:
             await _emit("info", "⏸ Agente pausado — escríbeme qué hacer", {"paused": True})
             await sess.pause_event.wait()
+            # Si pararon mientras estaba pausado, abortar
+            if not sess.running:
+                raise asyncio.CancelledError("Detenido durante pausa")
             # Inyectar guidance al reanudar
             if sess.guidance_messages and sess.agent:
                 guidance = " | ".join(sess.guidance_messages)
@@ -649,6 +682,10 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
             await _emit("action", "▶ Agente reanudado", {"paused": False})
 
     async def on_done(history: AgentHistoryList):
+        # Si fue detenido por el usuario, no procesar como completado
+        if not sess.running and sess.task and sess.task.cancelled():
+            return
+
         resultado = history.final_result() or ""
         sess.running = False
         success = bool(resultado) and not any(
@@ -831,8 +868,18 @@ async def api_stop(body: dict):
 
     sess.running = False
 
-    # 1. Cerrar el browser de browser-use
+    # 0. Desbloquear pausa si está esperando — evita que quede colgado
+    if not sess.pause_event.is_set():
+        sess.pause_event.set()
+
+    # 1. Intentar parada limpia del agente browser-use
     if sess.agent:
+        try:
+            if hasattr(sess.agent, "stop"):
+                await sess.agent.stop()
+        except Exception:
+            pass
+        # Cerrar browser session
         try:
             bs = getattr(sess.agent, "browser_session", None)
             if bs:
@@ -841,13 +888,13 @@ async def api_stop(body: dict):
         except Exception as e:
             logger.warning(f"⚠️ Error cerrando browser: {e}")
 
-    # 2. Cancelar el asyncio task
+    # 2. Cancelar el asyncio task (dispara CancelledError en agent.run)
     if sess.task and not sess.task.done():
         sess.task.cancel()
         try:
-            await asyncio.wait_for(asyncio.shield(sess.task), timeout=2.0)
+            await asyncio.wait_for(asyncio.shield(sess.task), timeout=3.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass  # Esperado
+            pass
 
     # 3. Notificar al frontend por WebSocket
     await manager.send(session_id, {
@@ -1003,14 +1050,28 @@ async def api_interact(body: dict):
                     element_desc = f"'{str(el_text).strip()[:40]}' en ({x},{y})"
             except Exception:
                 pass
-            await page.mouse.click(x, y)
+            # browser-use puede tener page.mouse como propiedad asíncrona
+            try:
+                mouse = page.mouse
+                if asyncio.iscoroutine(mouse):
+                    mouse = await mouse
+                await mouse.click(x, y)
+            except Exception:
+                # fallback: click via JS
+                await page.evaluate(f"(()=>{{const e=document.elementFromPoint({x},{y}); if(e) e.click();}})()")
             if sess.paused:
                 sess.human_actions.append(f"clic en {element_desc}")
                 await manager.send(session_id, {"tipo": "action", "mensaje": f"👆 Clic grabado: {element_desc}", "timestamp": datetime.now().strftime("%H:%M:%S")})
             return {"ok": True, "recorded": sess.paused}
 
         elif action == "type":
-            await page.keyboard.type(text)
+            try:
+                kb = page.keyboard
+                if asyncio.iscoroutine(kb):
+                    kb = await kb
+                await kb.type(text)
+            except Exception:
+                pass
             if sess.paused and text:
                 sess.human_actions.append(f"escribió '{text[:30]}'")
                 await manager.send(session_id, {"tipo": "action", "mensaje": f"⌨️ Texto grabado: '{text[:30]}'", "timestamp": datetime.now().strftime("%H:%M:%S")})
