@@ -505,18 +505,33 @@ select option { background: var(--bg2); }
 
     <!-- ── CAMPOS ── -->
     <div class="panel" id="panel-fields">
-      <div class="sec-label">Campos llenados en el formulario</div>
+
+      <!-- Campos detectados en el formulario -->
+      <div class="sec-label">Campos del formulario detectados</div>
       <div class="fields-wrap">
         <table class="fields-table">
-          <thead><tr><th>#</th><th>Campo</th><th>Valor ingresado</th><th>URL</th></tr></thead>
-          <tbody id="ftbody">
-            <tr><td colspan="4" class="empty-state">Los campos llenados aparecen aquí en tiempo real</td></tr>
+          <thead><tr><th>Campo</th><th>Tipo</th><th>Requerido</th></tr></thead>
+          <tbody id="ftbody-detected">
+            <tr><td colspan="3" class="empty-state">Se detectan al navegar al formulario</td></tr>
           </tbody>
         </table>
       </div>
-      <div id="fields-json-wrap" style="display:none; margin-top:12px;">
-        <div style="font-size:11px; font-weight:600; color:var(--txt3); margin-bottom:6px;">JSON de reentrada</div>
-        <pre id="fields-json" style="font-size:10px; background:var(--bg2); padding:10px; border-radius:var(--radius-sm); border:1px solid var(--border); overflow:auto; max-height:220px; color:var(--txt2); margin:0;"></pre>
+
+      <!-- Campos llenados por el bot -->
+      <div class="sec-label" style="margin-top:16px;">Valores ingresados por el bot</div>
+      <div class="fields-wrap">
+        <table class="fields-table">
+          <thead><tr><th>#</th><th>Campo</th><th>Valor ingresado</th></tr></thead>
+          <tbody id="ftbody">
+            <tr><td colspan="3" class="empty-state">Aparecen en tiempo real mientras el bot escribe</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- JSON de reentrada -->
+      <div id="fields-json-wrap" style="display:none; margin-top:16px;">
+        <div class="sec-label">JSON de reentrada (para repetir la tarea)</div>
+        <pre id="fields-json" style="font-size:10px; background:var(--bg2); padding:10px; border-radius:var(--radius-sm); border:1px solid var(--border); overflow:auto; max-height:240px; color:var(--txt2); margin:0;"></pre>
       </div>
     </div>
 
@@ -624,7 +639,12 @@ function handleMessage(d) {
   // Detectar fin de ejecución por tipo de mensaje
   if (['success','warn','error','stopped'].includes(d.tipo)) setStatus('idle');
 
-  // Campos de formulario llenados en tiempo real
+  // Campos detectados en el formulario (tras navigate)
+  if (d.tipo === 'form_detected' && d.fields) {
+    renderDetectedFields(d.fields);
+  }
+
+  // Campos llenados por el bot en tiempo real
   if (d.tipo === 'form_field' && d.all_fields) {
     updateFieldsTable(d.all_fields);
   }
@@ -694,7 +714,20 @@ async function sendGuidance() {
   }
 }
 
-// ─── Tabla de campos llenados (live) ─────────────────────────
+// ─── Campos detectados en formulario ─────────────────────────
+function renderDetectedFields(fields) {
+  const tbody = document.getElementById('ftbody-detected');
+  if (!fields || fields.length === 0) return;
+  tbody.innerHTML = fields.map(f => `
+    <tr>
+      <td>${escHtml(f.label || '—')}</td>
+      <td style="font-family:'DM Mono',monospace;font-size:10px;color:var(--txt3)">${escHtml(f.type||'')}</td>
+      <td style="text-align:center">${f.required ? '<span style="color:var(--red);font-weight:700">✱</span>' : '<span style="color:var(--txt3)">—</span>'}</td>
+    </tr>`).join('');
+  switchTab('fields');
+}
+
+// ─── Campos llenados por el bot (live) ────────────────────────
 function updateFieldsTable(fields) {
   const tbody = document.getElementById('ftbody');
   if (!fields || fields.length === 0) return;
@@ -703,10 +736,7 @@ function updateFieldsTable(fields) {
       <td style="color:var(--txt3);font-size:10px">${f.paso || i+1}</td>
       <td>${escHtml(f.campo || '—')}</td>
       <td style="font-family:'DM Mono',monospace;font-size:11px">${escHtml(String(f.valor || ''))}</td>
-      <td style="font-size:10px;color:var(--txt3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px" title="${escHtml(f.url||'')}">${escHtml((f.url||'').replace(/^https?:\/\//,'').substring(0,40))}</td>
     </tr>`).join('');
-  // Auto-navegar a campos si hay algo nuevo
-  switchTab('fields');
 }
 
 // ─── Navegación ───────────────────────────────────────────────

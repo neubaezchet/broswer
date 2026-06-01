@@ -31,13 +31,14 @@ from pydantic import BaseModel
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-# ── Gemini Computer Use ────────────────────────────────────────
+# ── Google genai (para detección de modelos en startup) ────────
 from google import genai
-from google.genai import types
-from google.genai.types import Content, Part
 
-# ── Playwright (control directo del navegador) ─────────────────
-from playwright.async_api import async_playwright
+# ── Browser-Use ────────────────────────────────────────────────
+from browser_use import Agent, BrowserProfile
+from browser_use.llm import ChatGoogle
+from browser_use.browser.views import BrowserStateSummary
+from browser_use.agent.views import AgentHistoryList, AgentOutput
 
 # ── Módulos extendidos ──────────────────────────────────────────
 from modules.site_mapper import map_portal, load_portal_map, install_network_interceptor
@@ -162,8 +163,7 @@ class AgentSession:
         self.start_time: float = 0
         self.current_url: str = ""
         self.session_id: str = ""
-        self.playwright_browser: Any = None   # instancia playwright Browser
-        self.playwright_page: Any = None      # instancia playwright Page
+        self.agent: Any = None                # instancia browser-use Agent
         self.pause_event: asyncio.Event = asyncio.Event()  # set=corriendo, clear=pausado
         self.human_actions: list[str] = []  # acciones grabadas mientras está pausado
         self.guidance_messages: list[str] = []  # instrucciones del operador en tiempo real
@@ -221,37 +221,46 @@ def save_task(entry: dict):
 # Screenshot loop — pantalla en vivo entre pasos del agente
 # ══════════════════════════════════════════════════════════════════
 
-# ── Modelo Computer Use ────────────────────────────────────────
-# gemini-2.5-computer-use-preview-10-2025 = modelo dedicado Computer Use
-# gemini-3-flash-preview = también soporta Computer Use nativamente
-COMPUTER_USE_MODELS = [
-    os.getenv("GEMINI_MODEL", "gemini-2.5-computer-use-preview-10-2025"),
-    "gemini-2.5-computer-use-preview-10-2025",
-    "gemini-3-flash-preview",
-]
-COMPUTER_USE_MODELS = list(dict.fromkeys(COMPUTER_USE_MODELS))
+# ── Servicio LLM (browser-use + Gemini 3.1 Pro) ───────────────
+class BrowserUseLLMService:
+    MODELS_FALLBACK = list(dict.fromkeys([
+        os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview"),
+        "gemini-3.1-pro-preview",
+        "gemini-3.5-flash",
+        "gemini-2.5-flash",
+    ]))
+
+    def __init__(self):
+        if not GOOGLE_API_KEY:
+            raise ValueError("GEMINI_API_KEY no configurada")
+        self.model = self._detect()
+        logger.warning(f"✅ LLM listo: {self.model}")
+
+    def _detect(self) -> str:
+        client = genai.Client(api_key=GOOGLE_API_KEY)
+        for m in self.MODELS_FALLBACK:
+            try:
+                logger.info(f"🔍 Probando: {m}")
+                client.models.generate_content(model=m, contents="hi")
+                logger.info(f"✅ '{m}' disponible")
+                return m
+            except Exception as e:
+                logger.warning(f"⚠️ '{m}': {str(e)[:80]}")
+        return self.MODELS_FALLBACK[-1]
+
+    def get_llm(self) -> ChatGoogle:
+        return ChatGoogle(
+            model=self.model,
+            api_key=GOOGLE_API_KEY,
+            thinking_level="high",  # máximo razonamiento Gemini 3 Pro
+        )
 
 
-def _detectar_modelo_computer_use() -> str:
-    """Prueba modelos Computer Use con llamada real — retorna el primero disponible."""
-    if not GOOGLE_API_KEY:
-        logger.error("❌ GOOGLE_API_KEY no configurada")
-        return COMPUTER_USE_MODELS[-1]
-    client = genai.Client(api_key=GOOGLE_API_KEY)
-    for modelo in COMPUTER_USE_MODELS:
-        try:
-            logger.info(f"🔍 Probando modelo Computer Use: {modelo}")
-            client.models.generate_content(model=modelo, contents="hi")
-            logger.info(f"✅ Modelo '{modelo}' disponible")
-            return modelo
-        except Exception as e:
-            logger.warning(f"⚠️ '{modelo}' no disponible: {str(e)[:100]}, probando siguiente...")
-    logger.error("❌ Ningún modelo respondió. Usando fallback.")
-    return COMPUTER_USE_MODELS[-1]
-
-
-ACTIVE_MODEL = _detectar_modelo_computer_use()
-logger.warning(f"🤖 Modelo Computer Use activo: {ACTIVE_MODEL}")
+try:
+    llm_service = BrowserUseLLMService()
+except Exception as e:
+    logger.error(f"❌ Error inicializando LLM: {e}")
+    llm_service = None
 
 
 async def _get_field_label(page: Any) -> str:
@@ -318,8 +327,8 @@ REGLAS:
 """
 
 
-async def _execute_computer_use_action(page: Any, fname: str, args: dict, sw: int, sh: int) -> dict:
-    """Ejecuta una acción del Computer Use API en Playwright. Coordenadas normalizadas 0-999."""
+async def _execute_computer_use_action_UNUSED(page: Any, fname: str, args: dict, sw: int, sh: int) -> dict:
+    """Retenida por referencia histórica — no se usa en el flujo browser-use."""
 
     def _x(v): return int(v / 1000 * sw)
     def _y(v): return int(v / 1000 * sh)
@@ -342,25 +351,65 @@ async def _execute_computer_use_action(page: Any, fname: str, args: dict, sw: in
         elif fname == "hover_at":
             await page.mouse.move(_x(args["x"]), _y(args["y"]))
         elif fname == "type_text_at":
-            x, y = _x(args["x"]), _y(args["y"])
+            x, y        = _x(args["x"]), _y(args["y"])
+            text        = str(args.get("text", ""))
+            clear_before = args.get("clear_before_typing", True)
+            press_enter  = args.get("press_enter", True)
+
+            # 1. Click para enfocar el campo
             await page.mouse.click(x, y)
-            if args.get("clear_before_typing", True):
-                await page.keyboard.press("Control+A")
-                await page.keyboard.press("Delete")
-            await page.keyboard.type(str(args["text"]), delay=40)
-            if args.get("press_enter", True):
+            await asyncio.sleep(0.3)
+
+            # 2. Llenar via JS nativo (soporta React / Angular / Vue)
+            filled = await page.evaluate(
+                """([x, y, text, clear]) => {
+                    const hit = document.elementFromPoint(x, y) || document.activeElement;
+                    if (!hit) return false;
+                    const inp = ['INPUT','TEXTAREA','SELECT'].includes(hit.tagName)
+                        ? hit : hit.closest('input,textarea,select,[contenteditable]');
+                    if (!inp) return false;
+                    inp.focus();
+                    const proto = inp.tagName === 'TEXTAREA'
+                        ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (setter && setter.set) {
+                        if (clear) setter.set.call(inp, '');
+                        setter.set.call(inp, text);
+                    } else {
+                        if (clear) inp.value = '';
+                        inp.value = text;
+                    }
+                    ['input','change'].forEach(t =>
+                        inp.dispatchEvent(new Event(t, {bubbles:true, cancelable:true})));
+                    inp.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true}));
+                    return true;
+                }""",
+                [x, y, text, clear_before]
+            )
+
+            if not filled:
+                # Fallback: teclado
+                if clear_before:
+                    await page.keyboard.press("Control+A")
+                    await page.keyboard.press("Delete")
+                    await asyncio.sleep(0.1)
+                await page.keyboard.type(text, delay=50)
+
+            if press_enter:
+                await asyncio.sleep(0.2)
                 await page.keyboard.press("Enter")
         elif fname == "key_combination":
             await page.keyboard.press(args["keys"])
         elif fname == "scroll_document":
             direction = args.get("direction", "down")
-            mapping = {"down": "PageDown", "up": "PageUp"}
-            if direction in mapping:
-                await page.keyboard.press(mapping[direction])
+            if direction == "down":
+                await page.evaluate("window.scrollBy(0, window.innerHeight * 0.75)")
+            elif direction == "up":
+                await page.evaluate("window.scrollBy(0, -window.innerHeight * 0.75)")
             elif direction == "right":
-                await page.evaluate("window.scrollBy(window.innerWidth * 0.8, 0)")
+                await page.evaluate("window.scrollBy(window.innerWidth * 0.75, 0)")
             elif direction == "left":
-                await page.evaluate("window.scrollBy(-window.innerWidth * 0.8, 0)")
+                await page.evaluate("window.scrollBy(-window.innerWidth * 0.75, 0)")
         elif fname == "scroll_at":
             x, y = _x(args["x"]), _y(args["y"])
             direction = args.get("direction", "down")
@@ -395,12 +444,55 @@ async def _execute_computer_use_action(page: Any, fname: str, args: dict, sw: in
     return {}
 
 
+async def _scan_and_emit_form_fields(page: Any, session_id: str, url: str):
+    """Detecta campos de formulario en el DOM y los emite para la pestaña Campos."""
+    try:
+        await asyncio.sleep(1.8)  # Esperar que el DOM renderice completamente
+        fields = await page.evaluate("""
+            () => {
+                const sel = [
+                    'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image])',
+                    'textarea', 'select'
+                ].join(',');
+                return Array.from(document.querySelectorAll(sel)).slice(0,30).map(el => {
+                    let label = '';
+                    if (el.id) {
+                        const lbl = document.querySelector('label[for="' + el.id + '"]');
+                        if (lbl) label = lbl.innerText.trim().replace(/[*:\\n\\t]/g,' ').trim().replace(/\\s+/g,' ');
+                    }
+                    if (!label) label = el.getAttribute('aria-label') || '';
+                    if (!label) label = el.placeholder || '';
+                    if (!label) {
+                        const p = el.closest('label');
+                        if (p) label = p.innerText.trim().split('\\n')[0];
+                    }
+                    if (!label) label = el.name || el.type || 'campo';
+                    const r = el.getBoundingClientRect();
+                    return {
+                        label: label.replace(/[*:]/g,'').trim(),
+                        type:  el.type || el.tagName.toLowerCase(),
+                        required: el.required || !!el.getAttribute('required'),
+                        visible: r.width > 0 && r.height > 0,
+                    };
+                }).filter(f => f.visible && f.label.length > 0);
+            }
+        """)
+        if fields:
+            await manager.send(session_id, {
+                "tipo": "form_detected",
+                "fields": fields,
+                "url": url,
+            })
+    except Exception as e:
+        logger.debug(f"form_scan failed: {e}")
+
+
 # ══════════════════════════════════════════════════════════════════
-# Agent runner — Gemini Computer Use API
+# Agent runner — browser-use + Gemini 3.1 Pro
 # ══════════════════════════════════════════════════════════════════
 
 async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = None):
-    """Corre el agente con Gemini Computer Use API y hace streaming via WebSocket."""
+    """Corre el agente browser-use con Gemini 3.1 Pro y hace streaming via WebSocket."""
     import base64
     sess = sessions[session_id]
     supervisor.register_agent(session_id=session_id, task=task)
@@ -418,218 +510,202 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
             payload.update(extra)
         await manager.send(session_id, payload)
 
-    if not GOOGLE_API_KEY:
-        await _emit("error", "❌ GEMINI_API_KEY no configurada")
+    if llm_service is None:
+        await _emit("error", "❌ LLM no inicializado. Verifica GEMINI_API_KEY.")
         sess.running = False
         return
 
-    await _emit("info", f"🚀 Iniciando Computer Use | Modelo: {ACTIVE_MODEL}")
+    llm = llm_service.get_llm()
+    await _emit("info", f"🚀 Iniciando agente | Modelo: {llm_service.model}")
 
-    SCREEN_W, SCREEN_H = 1440, 900
-    client = genai.Client(api_key=GOOGLE_API_KEY)
-
-    cu_config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        tools=[types.Tool(computer_use=types.ComputerUse(
-            environment=types.Environment.ENVIRONMENT_BROWSER
-        ))],
-    )
-
-    # Construir mensaje inicial
-    task_final = task
-    if pdf_paths:
-        task_final += f"\n\nARCHIVOS PDF DISPONIBLES: {', '.join(pdf_paths)}"
-        await _emit("info", f"📎 {len(pdf_paths)} PDF(s) adjunto(s)")
-
-    browser_args = [
+    # ── Browser profile ──────────────────────────────────────────
+    profile_args = [
         "--disable-blink-features=AutomationControlled",
+        "--disable-infobars",
+        "--no-first-run",
         "--no-sandbox",
         "--disable-dev-shm-usage",
-        "--disable-infobars",
-        f"--user-agent={random.choice(USER_AGENTS)}",
     ]
+    profile_kwargs: dict = {
+        "user_agent": random.choice(USER_AGENTS),
+        "headless": HEADLESS,
+        "wait_for_network_idle_page_load_time": 20.0,
+        "args": profile_args,
+    }
+    if CHROME_EXE:
+        profile_kwargs["executable_path"] = CHROME_EXE
+    profile = BrowserProfile(**profile_kwargs)
 
-    async with async_playwright() as playwright:
-        launch_kwargs: dict = {"headless": HEADLESS, "args": browser_args}
-        if CHROME_EXE:
-            launch_kwargs["executable_path"] = CHROME_EXE
+    # ── Task con PDFs ────────────────────────────────────────────
+    task_final = task
+    if pdf_paths:
+        task_final += f"\n\nARCHIVOS PDF DISPONIBLES para consulta: {', '.join(pdf_paths)}"
+        await _emit("info", f"📎 {len(pdf_paths)} PDF(s) adjunto(s)")
 
-        browser = await playwright.chromium.launch(**launch_kwargs)
-        page = await browser.new_page(viewport={"width": SCREEN_W, "height": SCREEN_H})
-        sess.playwright_browser = browser
-        sess.playwright_page = page
+    # ── Callbacks ────────────────────────────────────────────────
+    async def on_step(browser_state: BrowserStateSummary, output: AgentOutput, step_n: int):
+        sess.steps = step_n
+        url = getattr(browser_state, "url", "") or ""
+        sess.current_url = url
+        supervisor.update_agent(session_id=session_id, step_current=step_n, step_total=30, status="running")
 
-        try:
-            initial_screenshot = await page.screenshot(type="png")
-            contents = [
-                Content(role="user", parts=[
-                    Part(text=task_final),
-                    Part.from_bytes(data=initial_screenshot, mime_type="image/png"),
-                ])
-            ]
-
-            MAX_TURNS = 30
-            for turn in range(MAX_TURNS):
-                if not sess.running:
-                    break
-
-                sess.steps = turn + 1
-                supervisor.update_agent(session_id=session_id, step_current=turn + 1, step_total=MAX_TURNS, status="running")
-
-                # ── Instrucciones del operador pendientes ──────────────
-                if sess.guidance_messages:
-                    guidance = " | ".join(sess.guidance_messages)
-                    sess.guidance_messages.clear()
-                    contents.append(Content(role="user", parts=[Part(text=f"⚡ Instrucción del operador: {guidance}")]))
-                    await _emit("info", f"💬 Instrucción incorporada: {guidance[:120]}", {"step_n": turn + 1})
-
-                await _emit("info", f"🤔 Turno {turn + 1} — analizando pantalla...", {"step_n": turn + 1})
-
-                # Llamada a Gemini Computer Use
-                try:
-                    response = await client.aio.models.generate_content(
-                        model=ACTIVE_MODEL,
-                        contents=contents,
-                        config=cu_config,
-                    )
-                except Exception as e:
-                    await _emit("error", f"❌ Error API Gemini: {str(e)[:200]}")
-                    break
-
-                candidate = response.candidates[0]
-                contents.append(candidate.content)
-
-                # Mostrar texto del modelo (razonamiento)
-                for part in candidate.content.parts:
-                    if hasattr(part, "text") and part.text:
-                        await _emit("action", part.text[:300], {"step_n": turn + 1})
-
-                # Sin function_calls → tarea completada
-                has_fc = any(hasattr(p, "function_call") and p.function_call for p in candidate.content.parts)
-                if not has_fc:
-                    texto = " ".join(p.text for p in candidate.content.parts if hasattr(p, "text") and p.text)
-                    reentry = _build_reentry_json(task, sess.action_log, sess.form_fields)
-                    await _emit("success", f"✅ Tarea completada: {texto[:400]}", {"resultado": texto})
-                    save_task({
-                        "id": session_id, "tarea": task, "resultado": texto[:500],
-                        "pasos": sess.steps, "duracion": sess.elapsed(),
-                        "fecha": datetime.now().isoformat(), "exitoso": True,
-                        "action_log": sess.action_log,
-                        "form_fields": sess.form_fields,
-                        "reentry": reentry,
-                        "modelo": ACTIVE_MODEL,
-                    })
-                    await manager.send(session_id, {
-                        "tipo": "task_saved",
-                        "mensaje": "Tarea guardada",
-                        "form_fields": sess.form_fields,
-                        "action_log": sess.action_log,
-                        "reentry": reentry,
-                    })
-                    supervisor.finish_agent(session_id=session_id, success=True)
-                    break
-
-                # Ejecutar acciones
-                function_responses = []
-                for part in candidate.content.parts:
-                    if not (hasattr(part, "function_call") and part.function_call):
-                        continue
-
-                    fc = part.function_call
-                    fname = fc.name
-                    args = dict(fc.args) if fc.args else {}
-
-                    # Safety decision check
-                    safety = args.pop("safety_decision", None)
-                    if safety and isinstance(safety, dict) and safety.get("decision") == "require_confirmation":
-                        await _emit("warn", f"⚠️ Confirmación de seguridad: {safety.get('explanation', '')[:200]}")
-
-                    await _emit("action", f"▶ {fname}({str(args)[:120]})", {"step_n": turn + 1, "url": sess.current_url})
-
-                    result = await _execute_computer_use_action(page, fname, args, SCREEN_W, SCREEN_H)
-
-                    # ── Registrar en action_log ────────────────────────
-                    sess.action_log.append({
-                        "turno": turn + 1,
-                        "accion": fname,
-                        "args": {k: v for k, v in args.items()},
-                        "url": sess.current_url,
-                        "timestamp": datetime.now().isoformat(),
-                        "resultado": result.get("error", "ok") if result else "ok",
-                    })
-
-                    # ── Registrar campo de formulario si aplica ────────
-                    if fname == "type_text_at":
-                        field_label = await _get_field_label(page)
-                        field_entry = {
-                            "paso": turn + 1,
-                            "campo": field_label,
-                            "valor": str(args.get("text", "")),
-                            "url": sess.current_url,
-                        }
-                        sess.form_fields.append(field_entry)
-                        await manager.send(session_id, {
-                            "tipo": "form_field",
-                            "field": field_entry,
-                            "all_fields": sess.form_fields,
-                        })
-
-                    # Screenshot post-acción
-                    try:
-                        shot = await page.screenshot(type="png")
-                        current_url = page.url
-                        sess.current_url = current_url
-                        shot_b64 = base64.b64encode(shot).decode()
-                        await manager.send(session_id, {"tipo": "screenshot", "screenshot": shot_b64, "url": current_url, "step_n": turn + 1})
-                    except Exception:
-                        shot = initial_screenshot
-                        current_url = sess.current_url or ""
-
-                    response_data: dict = {"url": current_url}
-                    if safety:
-                        response_data["safety_acknowledgement"] = "true"
-                    response_data.update(result)
-
-                    function_responses.append(
-                        types.FunctionResponse(
-                            name=fname,
-                            response=response_data,
-                            parts=[types.FunctionResponsePart(
-                                inline_data=types.FunctionResponseBlob(mime_type="image/png", data=shot)
-                            )],
-                        )
-                    )
-
-                if function_responses:
-                    contents.append(Content(role="user", parts=[Part(function_response=fr) for fr in function_responses]))
-
-                # Anti-detección
-                await asyncio.sleep(random.gauss(0.7, 0.2))
-
-                # Pausa si el usuario pausó
-                if sess.paused:
-                    await _emit("info", "⏸ Agente pausado — escríbeme qué hacer", {"paused": True})
-                    await sess.pause_event.wait()
-                    await _emit("action", "▶ Agente reanudado", {"paused": False})
-
-            else:
-                await _emit("warn", f"⚠️ Límite de {MAX_TURNS} turnos alcanzado")
-                supervisor.finish_agent(session_id=session_id, success=False)
-
-        except asyncio.CancelledError:
-            await _emit("warn", "⛔ Agente detenido por el usuario")
-        except Exception as e:
-            await _emit("error", f"❌ Error: {str(e)}")
-            logger.error(f"❌ run_agent excepción: {e}", exc_info=True)
-            supervisor.finish_agent(session_id=session_id, success=False)
-        finally:
-            sess.running = False
-            sess.playwright_page = None
+        # ── Inyectar guidance pendiente en el historial del agente ─
+        if sess.guidance_messages and sess.agent:
+            guidance = " | ".join(sess.guidance_messages)
+            sess.guidance_messages.clear()
+            await _emit("info", f"💬 Instrucción del operador: {guidance}", {"step_n": step_n})
             try:
-                await browser.close()
+                # Inyectar en el message manager de browser-use
+                from browser_use.llm.messages import HumanMessage as BUHumanMessage
+                msg = BUHumanMessage(content=f"⚡ Instrucción del operador (actuar ahora): {guidance}")
+                if hasattr(sess.agent, '_message_manager') and hasattr(sess.agent._message_manager, '_messages'):
+                    sess.agent._message_manager._messages.append(msg)
+            except Exception as ge:
+                logger.debug(f"guidance inject: {ge}")
+
+        # ── Extraer info del paso ────────────────────────────────
+        state = output.current_state
+        next_goal  = getattr(state, "next_goal",  "") or ""
+        memory     = getattr(state, "memory",     "") or ""
+        evaluation = getattr(state, "evaluation_previous_goal", "") or ""
+
+        tipo = "action"
+        if evaluation and "success" in evaluation.lower():   tipo = "success"
+        elif evaluation and any(w in evaluation.lower() for w in ("fail", "error", "unable")): tipo = "warn"
+
+        mensaje = next_goal or f"Ejecutando paso {step_n}"
+        if evaluation:
+            mensaje = f"{evaluation} → {next_goal}" if next_goal else evaluation
+
+        await _emit(tipo, mensaje, {"step_n": step_n, "url": url, "memory": memory})
+
+        # ── Registrar en action_log ──────────────────────────────
+        sess.action_log.append({
+            "paso": step_n,
+            "objetivo": next_goal[:200],
+            "url": url,
+            "timestamp": datetime.now().isoformat(),
+        })
+
+        # ── Detectar campos del formulario en la página ──────────
+        if sess.agent and sess.agent.browser_session:
+            try:
+                page = await sess.agent.browser_session.get_current_page()
+                if page and url and not url.startswith("about:"):
+                    asyncio.create_task(_scan_and_emit_form_fields(page, session_id, url))
             except Exception:
                 pass
-            sess.playwright_browser = None
+
+        # ── Screenshot ──────────────────────────────────────────
+        screenshot = getattr(browser_state, "screenshot", None)
+        if screenshot:
+            if isinstance(screenshot, bytes):
+                screenshot = base64.b64encode(screenshot).decode()
+            if isinstance(screenshot, str) and screenshot.strip():
+                await manager.send(session_id, {
+                    "tipo": "screenshot", "screenshot": screenshot,
+                    "url": url, "step_n": step_n,
+                })
+
+        # Anti-detección
+        await asyncio.sleep(random.gauss(1.0, 0.3))
+
+        # ── Pausa ────────────────────────────────────────────────
+        if sess.paused:
+            await _emit("info", "⏸ Agente pausado — escríbeme qué hacer", {"paused": True})
+            await sess.pause_event.wait()
+            # Inyectar guidance al reanudar
+            if sess.guidance_messages and sess.agent:
+                guidance = " | ".join(sess.guidance_messages)
+                sess.guidance_messages.clear()
+                await _emit("info", f"💬 Instrucción: {guidance}")
+                try:
+                    from browser_use.llm.messages import HumanMessage as BUHumanMessage
+                    msg = BUHumanMessage(content=f"⚡ Instrucción del operador: {guidance}")
+                    if hasattr(sess.agent, '_message_manager') and hasattr(sess.agent._message_manager, '_messages'):
+                        sess.agent._message_manager._messages.append(msg)
+                except Exception:
+                    pass
+            await _emit("action", "▶ Agente reanudado", {"paused": False})
+
+    async def on_done(history: AgentHistoryList):
+        resultado = history.final_result() or ""
+        sess.running = False
+        success = bool(resultado) and not any(
+            w in resultado.lower() for w in ["error", "failed", "no se pudo", "unable"]
+        )
+        supervisor.finish_agent(session_id=session_id, success=success)
+
+        tipo = "success" if success else "error"
+        await _emit(tipo, f"{'✅' if success else '❌'} {resultado[:300]}", {"resultado": resultado})
+
+        # Detectar campos llenados del historial de browser-use
+        try:
+            for action in history.action_results():
+                action_dict = action.model_dump() if hasattr(action, 'model_dump') else {}
+                extracted = action_dict.get('extracted_content', '') or ''
+                if extracted and len(extracted) < 200:
+                    pass  # info extra si necesitamos
+        except Exception:
+            pass
+
+        reentry = _build_reentry_json(task, sess.action_log, sess.form_fields)
+        save_task({
+            "id": session_id, "tarea": task, "resultado": resultado[:500],
+            "pasos": sess.steps, "duracion": sess.elapsed(),
+            "fecha": datetime.now().isoformat(), "exitoso": success,
+            "action_log": sess.action_log,
+            "form_fields": sess.form_fields,
+            "reentry": reentry,
+            "modelo": llm_service.model if llm_service else "unknown",
+        })
+        await manager.send(session_id, {
+            "tipo": "task_saved", "mensaje": "Tarea guardada",
+            "form_fields": sess.form_fields,
+            "action_log": sess.action_log,
+            "reentry": reentry,
+        })
+
+        if success and sess.current_url:
+            try:
+                from urllib.parse import urlparse
+                portal_host = urlparse(sess.current_url).netloc
+                if portal_host:
+                    portal_memory.save_flow(
+                        portal=portal_host, task_description=task,
+                        steps=[{"step": i+1} for i in range(sess.steps)],
+                        duration_seconds=float(sess.elapsed()),
+                    )
+            except Exception:
+                pass
+
+    # ── Crear y correr el agente ─────────────────────────────────
+    agent = Agent(
+        task=task_final,
+        llm=llm,
+        browser_profile=profile,
+        system_prompt=SYSTEM_PROMPT,
+        register_new_step_callback=on_step,
+        register_done_callback=on_done,
+        max_steps=30,
+        max_total_time=600,
+    )
+    sess.agent = agent
+
+    try:
+        await _emit("info", "🌐 Abriendo navegador...")
+        logger.info(f"🚀 Agente browser-use | Modelo: {llm_service.model} | thinking: high")
+        await agent.run(max_steps=30)
+        logger.info(f"✅ Agente completó | Pasos: {sess.steps} | Duración: {sess.elapsed()}s")
+    except asyncio.CancelledError:
+        await _emit("warn", "⛔ Agente detenido por el usuario")
+        sess.running = False
+    except Exception as e:
+        await _emit("error", f"❌ Error del agente: {str(e)}")
+        sess.running = False
+        logger.error(f"❌ run_agent: {e}", exc_info=True)
+    finally:
+        sess.running = False
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -735,12 +811,15 @@ async def api_stop(body: dict):
 
     sess.running = False
 
-    # 1. Cerrar el browser de Playwright si está abierto
-    if sess.playwright_browser:
+    # 1. Cerrar el browser de browser-use
+    if sess.agent:
         try:
-            await sess.playwright_browser.close()
+            bs = getattr(sess.agent, "browser_session", None)
+            if bs:
+                if hasattr(bs, "close"):   await bs.close()
+                elif hasattr(bs, "stop"):  await bs.stop()
         except Exception as e:
-            logger.warning(f"⚠️ Error cerrando browser en stop: {e}")
+            logger.warning(f"⚠️ Error cerrando browser: {e}")
 
     # 2. Cancelar el asyncio task
     if sess.task and not sess.task.done():
@@ -867,7 +946,7 @@ async def api_config():
     return {
         "google_api_key": bool(GOOGLE_API_KEY),
         "capsolver_api_key": bool(CAPSOLVER_API_KEY),
-        "model": ACTIVE_MODEL,
+        "model": llm_service.model if llm_service else "not configured",
         "headless": HEADLESS,
         "railway": IS_RAILWAY,
     }
@@ -884,11 +963,15 @@ async def api_interact(body: dict):
     text       = body.get("text", "")
 
     sess = sessions.get(session_id)
-    page = sess.playwright_page if sess else None
-    if not sess or not page:
+    if not sess or not sess.agent:
         return JSONResponse({"ok": False, "error": "Sin agente activo"}, status_code=404)
 
     try:
+        bs = getattr(sess.agent, "browser_session", None)
+        page = await bs.get_current_page() if bs and hasattr(bs, "get_current_page") else None
+        if not page:
+            return JSONResponse({"ok": False, "error": "Página no disponible"}, status_code=404)
+
         if action == "click":
             element_desc = f"({x},{y})"
             try:
