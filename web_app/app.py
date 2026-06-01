@@ -577,7 +577,27 @@ async def run_agent(session_id: str, task: str, pdf_paths: list[str] | None = No
         if evaluation:
             mensaje = f"{evaluation} → {next_goal}" if next_goal else evaluation
 
-        await _emit(tipo, mensaje, {"step_n": step_n, "url": url, "memory": memory})
+        # ── Detección y resolución de CAPTCHA ───────────────────
+        captcha_keywords = ["captcha", "recaptcha", "hcaptcha", "robot", "verify"]
+        texto_lower = (mensaje + " " + memory).lower()
+        if any(kw in texto_lower for kw in captcha_keywords):
+            await _emit("warn", f"🔒 CAPTCHA detectado en paso {step_n}", {"step_n": step_n, "url": url, "captcha_detected": True})
+            if CAPSOLVER_API_KEY and sess.agent and sess.agent.browser_session:
+                await _emit("info", "🔐 Resolviendo CAPTCHA con CapSolver API...")
+                try:
+                    page = await sess.agent.browser_session.get_current_page()
+                    if page:
+                        solved = await handle_captcha(page, CAPSOLVER_API_KEY)
+                        if solved:
+                            await _emit("success", "✅ CAPTCHA resuelto automáticamente")
+                        else:
+                            await _emit("warn", "⚠️ CapSolver no pudo resolver — el bot intentará continuar")
+                except Exception as ce:
+                    await _emit("warn", f"⚠️ Error CapSolver: {ce}")
+            else:
+                await _emit("warn", "⚠️ CAPSOLVER_API_KEY no configurada — CAPTCHA puede bloquear la tarea")
+        else:
+            await _emit(tipo, mensaje, {"step_n": step_n, "url": url, "memory": memory})
 
         # ── Registrar en action_log ──────────────────────────────
         sess.action_log.append({
